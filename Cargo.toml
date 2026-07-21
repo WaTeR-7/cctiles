@@ -1,0 +1,12 @@
+[package]
+name = "cctiles"
+version = "0.1.0"
+edition = "2024"
+description = "A TUI app for running and monitoring multiple Claude Code CUI sessions in parallel"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/WaTeR-7/cctiles"
+readme = "README.md"
+keywords = ["cli", "tui", "claude", "terminal"]
+categories = ["command-line-utilities"]
+
+[dependencies]
