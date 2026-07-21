@@ -1,5 +1,7 @@
 mod config;
 mod session;
+#[allow(dead_code)] // not wired into the app yet; that's #17/#18's job
+mod transcript;
 
 use std::io;
 use std::path::PathBuf;
