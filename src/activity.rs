@@ -6,6 +6,38 @@ use serde_json::Value;
 /// with no matching `user` tool_result yet means that tool is still
 /// running; otherwise the latest assistant text is shown.
 pub fn summarize(lines: &[String]) -> String {
+    let state = parse_state(lines);
+    match state.pending {
+        Some(tool_use) => describe_tool_use(&tool_use.name, &tool_use.input),
+        None => match state.last_text {
+            Some(text) => truncate(text.trim(), 60),
+            None => "Idle".to_string(),
+        },
+    }
+}
+
+/// True when the session's most recent tool call is an interactive
+/// question (`AskUserQuestion`) still waiting on its result - i.e. the
+/// session is blocked waiting for the user to answer, distinct from
+/// waiting on a tool-permission prompt (#19).
+#[allow(dead_code)] // not wired into the app yet; that's #21's job
+pub fn is_waiting_for_answer(lines: &[String]) -> bool {
+    parse_state(lines)
+        .pending
+        .is_some_and(|tool_use| tool_use.name == "AskUserQuestion")
+}
+
+struct TranscriptState {
+    pending: Option<PendingToolUse>,
+    last_text: Option<String>,
+}
+
+struct PendingToolUse {
+    name: String,
+    input: Value,
+}
+
+fn parse_state(lines: &[String]) -> TranscriptState {
     let mut pending: Vec<(String, PendingToolUse)> = Vec::new();
     let mut last_text: Option<String> = None;
 
@@ -54,18 +86,10 @@ pub fn summarize(lines: &[String]) -> String {
         }
     }
 
-    match pending.last() {
-        Some((_, tool_use)) => describe_tool_use(&tool_use.name, &tool_use.input),
-        None => match last_text {
-            Some(text) => truncate(text.trim(), 60),
-            None => "Idle".to_string(),
-        },
+    TranscriptState {
+        pending: pending.pop().map(|(_, tool_use)| tool_use),
+        last_text,
     }
-}
-
-struct PendingToolUse {
-    name: String,
-    input: Value,
 }
 
 fn describe_tool_use(name: &str, input: &Value) -> String {
@@ -198,5 +222,43 @@ mod tests {
             assistant_tool_use("toolu_1", "Bash", serde_json::json!({"command": "ls"})),
         ];
         assert_eq!(summarize(&lines), "Running: ls");
+    }
+
+    #[test]
+    fn pending_ask_user_question_is_waiting_for_answer() {
+        let lines = vec![assistant_tool_use(
+            "toolu_1",
+            "AskUserQuestion",
+            serde_json::json!({"questions": []}),
+        )];
+        assert!(is_waiting_for_answer(&lines));
+    }
+
+    #[test]
+    fn resolved_ask_user_question_is_not_waiting() {
+        let lines = vec![
+            assistant_tool_use(
+                "toolu_1",
+                "AskUserQuestion",
+                serde_json::json!({"questions": []}),
+            ),
+            user_tool_result("toolu_1"),
+        ];
+        assert!(!is_waiting_for_answer(&lines));
+    }
+
+    #[test]
+    fn pending_non_question_tool_is_not_waiting_for_answer() {
+        let lines = vec![assistant_tool_use(
+            "toolu_1",
+            "Bash",
+            serde_json::json!({"command": "cargo test"}),
+        )];
+        assert!(!is_waiting_for_answer(&lines));
+    }
+
+    #[test]
+    fn no_entries_is_not_waiting_for_answer() {
+        assert!(!is_waiting_for_answer(&[]));
     }
 }
