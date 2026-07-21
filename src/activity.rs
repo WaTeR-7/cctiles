@@ -5,7 +5,6 @@ use serde_json::Value;
 /// doing, based on the format researched in #15: an `assistant` tool_use
 /// with no matching `user` tool_result yet means that tool is still
 /// running; otherwise the latest assistant text is shown.
-#[allow(dead_code)] // not wired into the app yet; that's #18's job
 pub fn summarize(lines: &[String]) -> String {
     let mut pending: Vec<(String, PendingToolUse)> = Vec::new();
     let mut last_text: Option<String> = None;

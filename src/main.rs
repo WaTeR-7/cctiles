@@ -1,7 +1,6 @@
 mod activity;
 mod config;
 mod session;
-#[allow(dead_code)] // not wired into the app yet; that's #17/#18's job
 mod transcript;
 
 use std::io;
@@ -330,17 +329,21 @@ fn draw_grid(
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let has_session = matches!(sessions.get(dir_index), Some(Some(_)));
-            let title = if has_session {
-                format!(" {dir} ")
-            } else {
-                format!(" {dir} [no session] ")
+            let summary = match sessions.get(dir_index) {
+                Some(Some(session)) => session.activity_summary(),
+                Some(None) => "[no session]".to_string(),
+                None => String::new(),
             };
-            let mut block = Block::bordered().title(title);
+            let mut block = Block::bordered().title(format!(" {dir} "));
             if (row_index, col_index) == focused {
                 block = block.border_style(Style::default().fg(Color::Yellow));
             }
+            let inner_area = block.inner(*tile_area);
             frame.render_widget(block, *tile_area);
+            frame.render_widget(
+                Paragraph::new(summary).wrap(ratatui::widgets::Wrap { trim: true }),
+                inner_area,
+            );
         }
     }
 
