@@ -17,7 +17,7 @@ const COLS: u16 = 80;
 const PERMISSION_PROMPT_MARKER: &str = "Do you want to proceed?";
 
 pub struct Session {
-    child: Box<dyn Child + Send + Sync>,
+    child: Mutex<Box<dyn Child + Send + Sync>>,
     master: Box<dyn MasterPty + Send>,
     writer: Mutex<Box<dyn Write + Send>>,
     screen: Arc<Mutex<vt100::Parser>>,
@@ -71,7 +71,7 @@ impl Session {
         let transcript = TranscriptWatcher::start(dir);
 
         Ok(Session {
-            child,
+            child: Mutex::new(child),
             master: pair.master,
             writer: Mutex::new(writer),
             screen,
@@ -125,8 +125,19 @@ impl Session {
         activity::summarize(&self.transcript.lines())
     }
 
+    /// Whether the child process is still running. Checked with a
+    /// non-blocking `try_wait`, so this is safe to call on every draw (#26).
+    pub fn is_alive(&self) -> bool {
+        self.child
+            .lock()
+            .map(|mut child| matches!(child.try_wait(), Ok(None)))
+            .unwrap_or(false)
+    }
+
     pub fn status(&self) -> SessionStatus {
-        if self.screen_contents().contains(PERMISSION_PROMPT_MARKER) {
+        if !self.is_alive() {
+            SessionStatus::Crashed
+        } else if self.screen_contents().contains(PERMISSION_PROMPT_MARKER) {
             SessionStatus::WaitingForPermission
         } else if activity::is_waiting_for_answer(&self.transcript.lines()) {
             SessionStatus::WaitingForAnswer
@@ -142,11 +153,16 @@ pub enum SessionStatus {
     Normal,
     WaitingForAnswer,
     WaitingForPermission,
+    /// The child process exited (crashed or otherwise) without being
+    /// deliberately killed via 'x' - see #26.
+    Crashed,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
     }
 }
 
@@ -288,5 +304,31 @@ mod tests {
             .with_screen(|screen| screen.size())
             .expect("screen lock should not be poisoned");
         assert_eq!(size, (40, 100));
+    }
+
+    #[test]
+    fn status_reflects_a_process_that_has_exited() {
+        let dir = std::env::temp_dir();
+        let session = Session::spawn_command("bash", &["-c", "exit 1"], dir.to_str().unwrap())
+            .expect("failed to spawn test session");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut status = session.status();
+        while Instant::now() < deadline && status != SessionStatus::Crashed {
+            std::thread::sleep(Duration::from_millis(50));
+            status = session.status();
+        }
+        assert_eq!(status, SessionStatus::Crashed);
+    }
+
+    #[test]
+    fn spawn_with_a_missing_binary_returns_an_error() {
+        let dir = std::env::temp_dir();
+        let result = Session::spawn_command(
+            "cctiles-definitely-not-a-real-binary",
+            &[],
+            dir.to_str().expect("temp dir path should be valid utf-8"),
+        );
+        assert!(result.is_err());
     }
 }

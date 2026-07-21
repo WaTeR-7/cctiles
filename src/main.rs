@@ -54,7 +54,7 @@ enum AppState {
     },
     Grid {
         config: Config,
-        sessions: Vec<Option<Session>>,
+        sessions: Vec<TileSession>,
         /// Handles for sessions killed via 'r'/'x' in the background, so
         /// they can be joined on quit instead of risking the process
         /// exiting before an in-flight kill has actually run.
@@ -67,17 +67,36 @@ enum AppState {
     },
 }
 
-fn spawn_sessions(dirs: &[String]) -> Vec<Option<Session>> {
-    dirs.iter().map(|dir| Session::spawn(dir).ok()).collect()
+/// A tile's session slot. Distinct from a plain `Option<Session>` so a
+/// failed spawn (e.g. the `claude` binary is missing) can show a clear
+/// in-tile error instead of looking the same as a deliberately empty tile
+/// (see #26).
+enum TileSession {
+    Empty,
+    Failed(String),
+    Running(Session),
+}
+
+impl TileSession {
+    fn spawn(dir: &str) -> Self {
+        match Session::spawn(dir) {
+            Ok(session) => TileSession::Running(session),
+            Err(err) => TileSession::Failed(err.to_string()),
+        }
+    }
+}
+
+fn spawn_sessions(dirs: &[String]) -> Vec<TileSession> {
+    dirs.iter().map(|dir| TileSession::spawn(dir)).collect()
 }
 
 /// Kills every session concurrently instead of one at a time, since each
 /// kill blocks for a noticeable moment confirming the process exited, and
 /// that cost would otherwise scale with the number of tiles.
-fn shutdown_sessions(sessions: &mut [Option<Session>]) {
+fn shutdown_sessions(sessions: &mut [TileSession]) {
     std::thread::scope(|scope| {
-        for session in sessions.iter_mut() {
-            if let Some(session) = session.take() {
+        for slot in sessions.iter_mut() {
+            if let TileSession::Running(session) = std::mem::replace(slot, TileSession::Empty) {
                 scope.spawn(move || drop(session));
             }
         }
@@ -229,7 +248,7 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                         *floating = false;
                     } else {
                         let index = config.tile_index(focused.0, focused.1);
-                        if let Some(Some(session)) = sessions.get(index)
+                        if let Some(TileSession::Running(session)) = sessions.get(index)
                             && let Some(bytes) = key_event_to_bytes(&key)
                         {
                             let _ = session.write_input(&bytes);
@@ -259,25 +278,28 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                         KeyCode::Char('r') => {
                             let index = config.tile_index(focused.0, focused.1);
                             if let Some(slot) = sessions.get_mut(index) {
-                                if let Some(old) = slot.take() {
+                                if let TileSession::Running(old) =
+                                    std::mem::replace(slot, TileSession::Empty)
+                                {
                                     pending_kills.push(kill_in_background(old));
                                 }
                                 if let Some(dir) = config.tile_dirs.get(index) {
-                                    *slot = Session::spawn(dir).ok();
+                                    *slot = TileSession::spawn(dir);
                                 }
                             }
                         }
                         KeyCode::Char('x') => {
                             let index = config.tile_index(focused.0, focused.1);
                             if let Some(slot) = sessions.get_mut(index)
-                                && let Some(old) = slot.take()
+                                && let TileSession::Running(old) =
+                                    std::mem::replace(slot, TileSession::Empty)
                             {
                                 pending_kills.push(kill_in_background(old));
                             }
                         }
                         KeyCode::Enter => {
                             let index = config.tile_index(focused.0, focused.1);
-                            if let Some(Some(_)) = sessions.get(index) {
+                            if let Some(TileSession::Running(_)) = sessions.get(index) {
                                 *floating = true;
                             }
                         }
@@ -335,7 +357,7 @@ fn draw(frame: &mut Frame, state: &AppState) {
         } => {
             let index = config.tile_index(focused.0, focused.1);
             match (floating, sessions.get(index)) {
-                (true, Some(Some(session))) => {
+                (true, Some(TileSession::Running(session))) => {
                     let dir = config
                         .tile_dirs
                         .get(index)
@@ -392,7 +414,7 @@ fn draw_tile_dirs(frame: &mut Frame, cols: u16, dirs: &[String], active: usize) 
 fn draw_grid(
     frame: &mut Frame,
     config: &Config,
-    sessions: &[Option<Session>],
+    sessions: &[TileSession],
     focused: (usize, usize),
 ) {
     let [grid_area, help_area] =
@@ -409,21 +431,34 @@ fn draw_grid(
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let (summary, status) = match sessions.get(dir_index) {
-                Some(Some(session)) => (session.activity_summary(), Some(session.status())),
-                Some(None) => ("[no session]".to_string(), None),
+            let (summary, status_color) = match sessions.get(dir_index) {
+                Some(TileSession::Running(session)) => {
+                    let status = session.status();
+                    let summary = if status == SessionStatus::Crashed {
+                        "Session ended unexpectedly. Press 'r' to restart.".to_string()
+                    } else {
+                        session.activity_summary()
+                    };
+                    let color = match status {
+                        SessionStatus::Crashed => Some(Color::Magenta),
+                        SessionStatus::WaitingForAnswer | SessionStatus::WaitingForPermission => {
+                            Some(Color::Red)
+                        }
+                        SessionStatus::Normal => None,
+                    };
+                    (summary, color)
+                }
+                Some(TileSession::Failed(err)) => {
+                    (format!("Failed to start: {err}"), Some(Color::Magenta))
+                }
+                Some(TileSession::Empty) => ("[no session]".to_string(), None),
                 None => (String::new(), None),
             };
-            let border_color = if matches!(
-                status,
-                Some(SessionStatus::WaitingForAnswer) | Some(SessionStatus::WaitingForPermission)
-            ) {
-                Some(Color::Red)
-            } else if (row_index, col_index) == focused {
+            let border_color = status_color.or(if (row_index, col_index) == focused {
                 Some(Color::Yellow)
             } else {
                 None
-            };
+            });
             let mut block = Block::bordered().title(format!(" {dir} "));
             if let Some(color) = border_color {
                 block = block.border_style(Style::default().fg(color));
@@ -459,7 +494,12 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
 /// default.
 fn draw_floating(frame: &mut Frame, dir: &str, session: &Session) {
     let area = frame.area();
-    let block = Block::bordered().title(format!(" {dir} — Ctrl+O: back to grid "));
+    let title = if session.status() == SessionStatus::Crashed {
+        format!(" {dir} — session ended — Ctrl+O: back to grid ")
+    } else {
+        format!(" {dir} — Ctrl+O: back to grid ")
+    };
+    let block = Block::bordered().title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -506,4 +546,53 @@ fn draw_floating(frame: &mut Frame, dir: &str, session: &Session) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn plain_char_becomes_its_utf8_bytes() {
+        assert_eq!(
+            key_event_to_bytes(&key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(b"x".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_letter_becomes_a_control_byte() {
+        assert_eq!(
+            key_event_to_bytes(&key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Some(vec![0x01])
+        );
+    }
+
+    #[test]
+    fn enter_becomes_carriage_return() {
+        assert_eq!(
+            key_event_to_bytes(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(b"\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn arrow_keys_become_ansi_escape_sequences() {
+        assert_eq!(
+            key_event_to_bytes(&key(KeyCode::Up, KeyModifiers::NONE)),
+            Some(b"\x1b[A".to_vec())
+        );
+    }
+
+    #[test]
+    fn keys_with_no_reasonable_encoding_are_ignored() {
+        assert_eq!(
+            key_event_to_bytes(&key(KeyCode::F(5), KeyModifiers::NONE)),
+            None
+        );
+    }
 }
