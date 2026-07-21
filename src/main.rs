@@ -1,6 +1,11 @@
+mod config;
+
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use clap::Parser;
+use config::Config;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -11,10 +16,17 @@ use ratatui::widgets::{Block, Paragraph};
 const MIN_GRID_SIZE: u16 = 1;
 const MAX_GRID_SIZE: u16 = 6;
 
-struct Config {
-    rows: usize,
-    cols: usize,
-    tile_dirs: Vec<String>,
+/// A TUI app for running and monitoring multiple Claude Code CUI sessions in parallel.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    /// Path to a config file to use instead of the default location.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Force the interactive setup screen even if a config file exists.
+    #[arg(long)]
+    setup: bool,
 }
 
 enum SizeField {
@@ -47,19 +59,33 @@ fn default_dir() -> String {
 }
 
 fn main() -> io::Result<()> {
+    let cli = Cli::parse();
+    let config_path = cli.config.or_else(config::default_path).ok_or_else(|| {
+        io::Error::other("could not determine a config file location for this platform")
+    })?;
+
+    let initial_state = if !cli.setup
+        && let Some(config) = config::load(&config_path)
+    {
+        AppState::Grid {
+            config,
+            focused: (0, 0),
+        }
+    } else {
+        AppState::GridSize {
+            rows: 2,
+            cols: 3,
+            field: SizeField::Rows,
+        }
+    };
+
     let terminal = ratatui::init();
-    let result = run(terminal);
+    let result = run(terminal, config_path, initial_state);
     ratatui::restore();
     result
 }
 
-fn run(mut terminal: DefaultTerminal) -> io::Result<()> {
-    let mut state = AppState::GridSize {
-        rows: 2,
-        cols: 3,
-        field: SizeField::Rows,
-    };
-
+fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState) -> io::Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, &state))?;
 
@@ -121,12 +147,14 @@ fn run(mut terminal: DefaultTerminal) -> io::Result<()> {
                 }
                 KeyCode::Char(c) => dirs[*active].push(c),
                 KeyCode::Enter => {
+                    let config = Config {
+                        rows: *rows as usize,
+                        cols: *cols as usize,
+                        tile_dirs: dirs.clone(),
+                    };
+                    let _ = config::save(&config_path, &config);
                     state = AppState::Grid {
-                        config: Config {
-                            rows: *rows as usize,
-                            cols: *cols as usize,
-                            tile_dirs: dirs.clone(),
-                        },
+                        config,
                         focused: (0, 0),
                     };
                 }
