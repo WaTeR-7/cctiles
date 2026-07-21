@@ -9,6 +9,12 @@ pub struct Config {
     pub tile_dirs: Vec<String>,
 }
 
+impl Config {
+    pub fn tile_index(&self, row: usize, col: usize) -> usize {
+        row * self.cols + col
+    }
+}
+
 pub fn default_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "cctiles")
         .map(|dirs| dirs.config_dir().join("config.toml"))
