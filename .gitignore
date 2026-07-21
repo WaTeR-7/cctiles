@@ -6,3 +6,6 @@
 
 # OS
 .DS_Store
+
+# scratch fixtures for manual testing (e.g. Issue #19 permission-prompt capture)
+/temp/
