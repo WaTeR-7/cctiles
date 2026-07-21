@@ -1,4 +1,5 @@
 mod config;
+mod session;
 
 use std::io;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Paragraph};
+use session::Session;
 
 const MIN_GRID_SIZE: u16 = 1;
 const MAX_GRID_SIZE: u16 = 6;
@@ -48,8 +50,13 @@ enum AppState {
     },
     Grid {
         config: Config,
+        sessions: Vec<Option<Session>>,
         focused: (usize, usize),
     },
+}
+
+fn spawn_sessions(dirs: &[String]) -> Vec<Option<Session>> {
+    dirs.iter().map(|dir| Session::spawn(dir).ok()).collect()
 }
 
 fn default_dir() -> String {
@@ -67,8 +74,10 @@ fn main() -> io::Result<()> {
     let initial_state = if !cli.setup
         && let Some(config) = config::load(&config_path)
     {
+        let sessions = spawn_sessions(&config.tile_dirs);
         AppState::Grid {
             config,
+            sessions,
             focused: (0, 0),
         }
     } else {
@@ -153,14 +162,18 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                         tile_dirs: dirs.clone(),
                     };
                     let _ = config::save(&config_path, &config);
+                    let sessions = spawn_sessions(&config.tile_dirs);
                     state = AppState::Grid {
                         config,
+                        sessions,
                         focused: (0, 0),
                     };
                 }
                 _ => {}
             },
-            AppState::Grid { config, focused } => match key.code {
+            AppState::Grid {
+                config, focused, ..
+            } => match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Up | KeyCode::Char('k') => focused.0 = focused.0.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -182,7 +195,11 @@ fn draw(frame: &mut Frame, state: &AppState) {
         AppState::TileDirs {
             cols, dirs, active, ..
         } => draw_tile_dirs(frame, *cols, dirs, *active),
-        AppState::Grid { config, focused } => draw_grid(frame, config, *focused),
+        AppState::Grid {
+            config,
+            sessions,
+            focused,
+        } => draw_grid(frame, config, sessions, *focused),
     }
 }
 
@@ -226,7 +243,12 @@ fn draw_tile_dirs(frame: &mut Frame, cols: u16, dirs: &[String], active: usize) 
     );
 }
 
-fn draw_grid(frame: &mut Frame, config: &Config, focused: (usize, usize)) {
+fn draw_grid(
+    frame: &mut Frame,
+    config: &Config,
+    sessions: &[Option<Session>],
+    focused: (usize, usize),
+) {
     let rows = Layout::vertical(vec![Constraint::Fill(1); config.rows]).split(frame.area());
 
     for (row_index, row_area) in rows.iter().enumerate() {
@@ -238,7 +260,12 @@ fn draw_grid(frame: &mut Frame, config: &Config, focused: (usize, usize)) {
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let title = format!(" {dir} ");
+            let failed = matches!(sessions.get(dir_index), Some(None));
+            let title = if failed {
+                format!(" {dir} [failed to start] ")
+            } else {
+                format!(" {dir} ")
+            };
             let mut block = Block::bordered().title(title);
             if (row_index, col_index) == focused {
                 block = block.border_style(Style::default().fg(Color::Yellow));
