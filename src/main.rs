@@ -16,7 +16,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Paragraph};
-use session::Session;
+use session::{Session, SessionStatus};
 
 const MIN_GRID_SIZE: u16 = 1;
 const MAX_GRID_SIZE: u16 = 6;
@@ -329,14 +329,21 @@ fn draw_grid(
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let summary = match sessions.get(dir_index) {
-                Some(Some(session)) => session.activity_summary(),
-                Some(None) => "[no session]".to_string(),
-                None => String::new(),
+            let (summary, status) = match sessions.get(dir_index) {
+                Some(Some(session)) => (session.activity_summary(), Some(session.status())),
+                Some(None) => ("[no session]".to_string(), None),
+                None => (String::new(), None),
+            };
+            let border_color = if status == Some(SessionStatus::WaitingForAnswer) {
+                Some(Color::Red)
+            } else if (row_index, col_index) == focused {
+                Some(Color::Yellow)
+            } else {
+                None
             };
             let mut block = Block::bordered().title(format!(" {dir} "));
-            if (row_index, col_index) == focused {
-                block = block.border_style(Style::default().fg(Color::Yellow));
+            if let Some(color) = border_color {
+                block = block.border_style(Style::default().fg(color));
             }
             let inner_area = block.inner(*tile_area);
             frame.render_widget(block, *tile_area);

@@ -81,6 +81,23 @@ impl Session {
     pub fn activity_summary(&self) -> String {
         activity::summarize(&self.transcript.lines())
     }
+
+    pub fn status(&self) -> SessionStatus {
+        let lines = self.transcript.lines();
+        if activity::is_waiting_for_answer(&lines) {
+            SessionStatus::WaitingForAnswer
+        } else {
+            SessionStatus::Normal
+        }
+    }
+}
+
+/// A session's status as relevant to the grid's status highlighting.
+/// `WaitingForPermission` will join this once #19 is resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Normal,
+    WaitingForAnswer,
 }
 
 impl Drop for Session {
@@ -119,5 +136,51 @@ mod tests {
             contents.contains("hello-vt100-test"),
             "expected screen contents to contain the test marker, got: {contents:?}"
         );
+    }
+
+    #[test]
+    fn status_reflects_waiting_for_answer() {
+        let scratch_dir =
+            std::env::temp_dir().join(format!("cctiles-status-test-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
+        let dir_str = scratch_dir
+            .to_str()
+            .expect("scratch dir path should be valid utf-8");
+
+        let session = Session::spawn_command("bash", &["-c", "sleep 5"], dir_str)
+            .expect("failed to spawn test session");
+        assert_eq!(session.status(), SessionStatus::Normal);
+
+        let sanitized: String = dir_str
+            .chars()
+            .map(|c| if c == '/' { '-' } else { c })
+            .collect();
+        let project_dir = directories::BaseDirs::new()
+            .expect("should be able to determine home dir")
+            .home_dir()
+            .join(".claude")
+            .join("projects")
+            .join(&sanitized);
+        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
+
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_x", "name": "AskUserQuestion", "input": {}}
+            ]},
+        })
+        .to_string();
+        std::fs::write(project_dir.join("fake-session.jsonl"), line + "\n")
+            .expect("failed to write fake transcript");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut status = session.status();
+        while Instant::now() < deadline && status != SessionStatus::WaitingForAnswer {
+            std::thread::sleep(Duration::from_millis(50));
+            status = session.status();
+        }
+        assert_eq!(status, SessionStatus::WaitingForAnswer);
+
+        let _ = std::fs::remove_dir_all(&project_dir);
     }
 }
