@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use clap::Parser;
 use config::Config;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use session::{Session, SessionStatus};
 
@@ -59,6 +60,10 @@ enum AppState {
         /// exiting before an in-flight kill has actually run.
         pending_kills: Vec<JoinHandle<()>>,
         focused: (usize, usize),
+        /// True while the focused tile's session is shown full-screen (#22),
+        /// in which case key input is forwarded to it instead of driving
+        /// grid navigation.
+        floating: bool,
     },
 }
 
@@ -109,6 +114,7 @@ fn main() -> io::Result<()> {
             sessions,
             pending_kills: Vec::new(),
             focused: (0, 0),
+            floating: false,
         }
     } else {
         AppState::GridSize {
@@ -204,6 +210,7 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                         sessions,
                         pending_kills: Vec::new(),
                         focused: (0, 0),
+                        floating: false,
                     };
                 }
                 _ => {}
@@ -213,44 +220,103 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                 sessions,
                 pending_kills,
                 focused,
-            } => match key.code {
-                KeyCode::Char('q') => {
-                    shutdown_sessions(sessions);
-                    for handle in pending_kills.drain(..) {
-                        let _ = handle.join();
-                    }
-                    return Ok(());
-                }
-                KeyCode::Up | KeyCode::Char('k') => focused.0 = focused.0.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    focused.0 = (focused.0 + 1).min(config.rows - 1);
-                }
-                KeyCode::Left | KeyCode::Char('h') => focused.1 = focused.1.saturating_sub(1),
-                KeyCode::Right | KeyCode::Char('l') => {
-                    focused.1 = (focused.1 + 1).min(config.cols - 1);
-                }
-                KeyCode::Char('r') => {
-                    let index = config.tile_index(focused.0, focused.1);
-                    if let Some(slot) = sessions.get_mut(index) {
-                        if let Some(old) = slot.take() {
-                            pending_kills.push(kill_in_background(old));
-                        }
-                        if let Some(dir) = config.tile_dirs.get(index) {
-                            *slot = Session::spawn(dir).ok();
+                floating,
+            } => {
+                if *floating {
+                    let is_detach = key.code == KeyCode::Char('o')
+                        && key.modifiers.contains(KeyModifiers::CONTROL);
+                    if is_detach {
+                        *floating = false;
+                    } else {
+                        let index = config.tile_index(focused.0, focused.1);
+                        if let Some(Some(session)) = sessions.get(index)
+                            && let Some(bytes) = key_event_to_bytes(&key)
+                        {
+                            let _ = session.write_input(&bytes);
                         }
                     }
-                }
-                KeyCode::Char('x') => {
-                    let index = config.tile_index(focused.0, focused.1);
-                    if let Some(slot) = sessions.get_mut(index)
-                        && let Some(old) = slot.take()
-                    {
-                        pending_kills.push(kill_in_background(old));
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            shutdown_sessions(sessions);
+                            for handle in pending_kills.drain(..) {
+                                let _ = handle.join();
+                            }
+                            return Ok(());
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            focused.0 = focused.0.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            focused.0 = (focused.0 + 1).min(config.rows - 1);
+                        }
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            focused.1 = focused.1.saturating_sub(1);
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            focused.1 = (focused.1 + 1).min(config.cols - 1);
+                        }
+                        KeyCode::Char('r') => {
+                            let index = config.tile_index(focused.0, focused.1);
+                            if let Some(slot) = sessions.get_mut(index) {
+                                if let Some(old) = slot.take() {
+                                    pending_kills.push(kill_in_background(old));
+                                }
+                                if let Some(dir) = config.tile_dirs.get(index) {
+                                    *slot = Session::spawn(dir).ok();
+                                }
+                            }
+                        }
+                        KeyCode::Char('x') => {
+                            let index = config.tile_index(focused.0, focused.1);
+                            if let Some(slot) = sessions.get_mut(index)
+                                && let Some(old) = slot.take()
+                            {
+                                pending_kills.push(kill_in_background(old));
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let index = config.tile_index(focused.0, focused.1);
+                            if let Some(Some(_)) = sessions.get(index) {
+                                *floating = true;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
-            },
+            }
         }
+    }
+}
+
+/// Translates a key event into the raw bytes a real terminal would send for
+/// it, so it can be forwarded into a floated session's PTY (#22/#23). Keys
+/// with no reasonable terminal encoding (e.g. function keys) are ignored.
+fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && let KeyCode::Char(c) = key.code
+    {
+        let lower = c.to_ascii_lowercase();
+        if lower.is_ascii_lowercase() {
+            return Some(vec![lower as u8 - b'a' + 1]);
+        }
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(c.to_string().into_bytes()),
+        KeyCode::Enter => Some(b"\r".to_vec()),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab => Some(vec![0x09]),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        _ => None,
     }
 }
 
@@ -264,8 +330,22 @@ fn draw(frame: &mut Frame, state: &AppState) {
             config,
             sessions,
             focused,
+            floating,
             ..
-        } => draw_grid(frame, config, sessions, *focused),
+        } => {
+            let index = config.tile_index(focused.0, focused.1);
+            match (floating, sessions.get(index)) {
+                (true, Some(Some(session))) => {
+                    let dir = config
+                        .tile_dirs
+                        .get(index)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    draw_floating(frame, dir, session);
+                }
+                _ => draw_grid(frame, config, sessions, *focused),
+            }
+        }
     }
 }
 
@@ -358,7 +438,72 @@ fn draw_grid(
     }
 
     frame.render_widget(
-        Paragraph::new("hjkl/arrows: move   r: restart tile   x: kill tile   q: quit"),
+        Paragraph::new(
+            "hjkl/arrows: move   enter: open terminal   r: restart tile   x: kill tile   q: quit",
+        ),
         help_area,
     );
+}
+
+fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Renders a session's live screen full-screen, matching the underlying
+/// PTY's size to the rendered area every frame (#22/#24) so it always
+/// reflects the real terminal window rather than the hardcoded spawn-time
+/// default.
+fn draw_floating(frame: &mut Frame, dir: &str, session: &Session) {
+    let area = frame.area();
+    let block = Block::bordered().title(format!(" {dir} — Ctrl+O: back to grid "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let _ = session.resize(inner.height, inner.width);
+
+    session.with_screen(|screen| {
+        let (rows, cols) = screen.size();
+        let mut lines = Vec::with_capacity(rows as usize);
+        for row in 0..rows {
+            let mut spans = Vec::with_capacity(cols as usize);
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                let mut style = Style::default()
+                    .fg(vt100_color_to_ratatui(cell.fgcolor()))
+                    .bg(vt100_color_to_ratatui(cell.bgcolor()));
+                if cell.bold() {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.italic() {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if cell.underline() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                let contents = cell.contents();
+                let text = if contents.is_empty() {
+                    " ".to_string()
+                } else {
+                    contents.to_string()
+                };
+                spans.push(Span::styled(text, style));
+            }
+            lines.push(Line::from(spans));
+        }
+        frame.render_widget(Paragraph::new(lines), inner);
+
+        if !screen.hide_cursor() {
+            let (cursor_row, cursor_col) = screen.cursor_position();
+            frame.set_cursor_position(Position {
+                x: inner.x + cursor_col,
+                y: inner.y + cursor_row,
+            });
+        }
+    });
 }
