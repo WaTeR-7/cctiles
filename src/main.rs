@@ -3,6 +3,7 @@ mod session;
 
 use std::io;
 use std::path::PathBuf;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use clap::Parser;
@@ -51,6 +52,10 @@ enum AppState {
     Grid {
         config: Config,
         sessions: Vec<Option<Session>>,
+        /// Handles for sessions killed via 'r'/'x' in the background, so
+        /// they can be joined on quit instead of risking the process
+        /// exiting before an in-flight kill has actually run.
+        pending_kills: Vec<JoinHandle<()>>,
         focused: (usize, usize),
     },
 }
@@ -72,6 +77,15 @@ fn shutdown_sessions(sessions: &mut [Option<Session>]) {
     });
 }
 
+/// Kills a single session without blocking the caller, since dropping it
+/// synchronously would freeze the UI for the same noticeable moment as
+/// shutdown_sessions' individual kills. The returned handle must be kept
+/// (e.g. in `pending_kills`) and joined before the app exits, or the kill
+/// may not have actually happened yet if the process exits first.
+fn kill_in_background(session: Session) -> JoinHandle<()> {
+    std::thread::spawn(move || drop(session))
+}
+
 fn default_dir() -> String {
     std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -91,6 +105,7 @@ fn main() -> io::Result<()> {
         AppState::Grid {
             config,
             sessions,
+            pending_kills: Vec::new(),
             focused: (0, 0),
         }
     } else {
@@ -161,7 +176,13 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                 dirs,
                 active,
             } => match key.code {
-                KeyCode::Esc => return Ok(()),
+                KeyCode::Esc => {
+                    state = AppState::GridSize {
+                        rows: *rows,
+                        cols: *cols,
+                        field: SizeField::Rows,
+                    };
+                }
                 KeyCode::Up => *active = active.saturating_sub(1),
                 KeyCode::Down => *active = (*active + 1).min(dirs.len() - 1),
                 KeyCode::Backspace => {
@@ -179,6 +200,7 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                     state = AppState::Grid {
                         config,
                         sessions,
+                        pending_kills: Vec::new(),
                         focused: (0, 0),
                     };
                 }
@@ -187,10 +209,14 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
             AppState::Grid {
                 config,
                 sessions,
+                pending_kills,
                 focused,
             } => match key.code {
                 KeyCode::Char('q') => {
                     shutdown_sessions(sessions);
+                    for handle in pending_kills.drain(..) {
+                        let _ = handle.join();
+                    }
                     return Ok(());
                 }
                 KeyCode::Up | KeyCode::Char('k') => focused.0 = focused.0.saturating_sub(1),
@@ -202,18 +228,22 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                     focused.1 = (focused.1 + 1).min(config.cols - 1);
                 }
                 KeyCode::Char('r') => {
-                    let index = focused.0 * config.cols + focused.1;
+                    let index = config.tile_index(focused.0, focused.1);
                     if let Some(slot) = sessions.get_mut(index) {
-                        *slot = None;
+                        if let Some(old) = slot.take() {
+                            pending_kills.push(kill_in_background(old));
+                        }
                         if let Some(dir) = config.tile_dirs.get(index) {
                             *slot = Session::spawn(dir).ok();
                         }
                     }
                 }
                 KeyCode::Char('x') => {
-                    let index = focused.0 * config.cols + focused.1;
-                    if let Some(slot) = sessions.get_mut(index) {
-                        *slot = None;
+                    let index = config.tile_index(focused.0, focused.1);
+                    if let Some(slot) = sessions.get_mut(index)
+                        && let Some(old) = slot.take()
+                    {
+                        pending_kills.push(kill_in_background(old));
                     }
                 }
                 _ => {}
@@ -232,6 +262,7 @@ fn draw(frame: &mut Frame, state: &AppState) {
             config,
             sessions,
             focused,
+            ..
         } => draw_grid(frame, config, sessions, *focused),
     }
 }
@@ -267,7 +298,7 @@ fn draw_tile_dirs(frame: &mut Frame, cols: u16, dirs: &[String], active: usize) 
     }
     lines.push(String::new());
     lines.push(
-        "Up/Down: switch tile   Type: edit path   Enter: confirm all   Esc: quit".to_string(),
+        "Up/Down: switch tile   Type: edit path   Enter: confirm all   Esc: back".to_string(),
     );
 
     frame.render_widget(
@@ -290,7 +321,7 @@ fn draw_grid(
     for (row_index, row_area) in rows.iter().enumerate() {
         let cols = Layout::horizontal(vec![Constraint::Fill(1); config.cols]).split(*row_area);
         for (col_index, tile_area) in cols.iter().enumerate() {
-            let dir_index = row_index * config.cols + col_index;
+            let dir_index = config.tile_index(row_index, col_index);
             let dir = config
                 .tile_dirs
                 .get(dir_index)
