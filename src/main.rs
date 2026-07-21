@@ -59,6 +59,19 @@ fn spawn_sessions(dirs: &[String]) -> Vec<Option<Session>> {
     dirs.iter().map(|dir| Session::spawn(dir).ok()).collect()
 }
 
+/// Kills every session concurrently instead of one at a time, since each
+/// kill blocks for a noticeable moment confirming the process exited, and
+/// that cost would otherwise scale with the number of tiles.
+fn shutdown_sessions(sessions: &mut [Option<Session>]) {
+    std::thread::scope(|scope| {
+        for session in sessions.iter_mut() {
+            if let Some(session) = session.take() {
+                scope.spawn(move || drop(session));
+            }
+        }
+    });
+}
+
 fn default_dir() -> String {
     std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -172,9 +185,14 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                 _ => {}
             },
             AppState::Grid {
-                config, focused, ..
+                config,
+                sessions,
+                focused,
             } => match key.code {
-                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char('q') => {
+                    shutdown_sessions(sessions);
+                    return Ok(());
+                }
                 KeyCode::Up | KeyCode::Char('k') => focused.0 = focused.0.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => {
                     focused.0 = (focused.0 + 1).min(config.rows - 1);
