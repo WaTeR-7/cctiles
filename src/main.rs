@@ -64,6 +64,9 @@ enum AppState {
         /// in which case key input is forwarded to it instead of driving
         /// grid navigation.
         floating: bool,
+        /// True while the keybinding help overlay (#25) is shown on top of
+        /// the grid.
+        help_visible: bool,
     },
 }
 
@@ -134,6 +137,7 @@ fn main() -> io::Result<()> {
             pending_kills: Vec::new(),
             focused: (0, 0),
             floating: false,
+            help_visible: false,
         }
     } else {
         AppState::GridSize {
@@ -230,6 +234,7 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                         pending_kills: Vec::new(),
                         focused: (0, 0),
                         floating: false,
+                        help_visible: false,
                     };
                 }
                 _ => {}
@@ -240,6 +245,7 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                 pending_kills,
                 focused,
                 floating,
+                help_visible,
             } => {
                 if *floating {
                     let is_detach = key.code == KeyCode::Char('o')
@@ -254,8 +260,13 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                             let _ = session.write_input(&bytes);
                         }
                     }
+                } else if *help_visible {
+                    *help_visible = false;
                 } else {
                     match key.code {
+                        KeyCode::Char('?') => {
+                            *help_visible = true;
+                        }
                         KeyCode::Char('q') => {
                             shutdown_sessions(sessions);
                             for handle in pending_kills.drain(..) {
@@ -353,6 +364,7 @@ fn draw(frame: &mut Frame, state: &AppState) {
             sessions,
             focused,
             floating,
+            help_visible,
             ..
         } => {
             let index = config.tile_index(focused.0, focused.1);
@@ -366,6 +378,9 @@ fn draw(frame: &mut Frame, state: &AppState) {
                     draw_floating(frame, dir, session);
                 }
                 _ => draw_grid(frame, config, sessions, *focused),
+            }
+            if *help_visible {
+                draw_help(frame);
             }
         }
     }
@@ -474,9 +489,46 @@ fn draw_grid(
 
     frame.render_widget(
         Paragraph::new(
-            "hjkl/arrows: move   enter: open terminal   r: restart tile   x: kill tile   q: quit",
+            "hjkl/arrows: move   enter: open terminal   r: restart   x: kill   ?: help   q: quit",
         ),
         help_area,
+    );
+}
+
+/// Centers a `width`x`height` rect within `area`, clamped so it never
+/// exceeds it. Used to place the keybinding help overlay (#25).
+fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    ratatui::layout::Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+fn draw_help(frame: &mut Frame) {
+    let area = centered_rect(64, 15, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let text = "\
+Grid
+  hjkl / arrow keys   move focus
+  enter               open the focused session full-screen
+  r                   restart the focused tile's session
+  x                   kill the focused tile's session
+  q                   quit
+
+Floating terminal
+  (typing)            forwarded to the session
+  ctrl+o              back to the grid
+
+?                     toggle this help, any key closes it";
+
+    frame.render_widget(
+        Paragraph::new(text).block(Block::bordered().title(" Keybindings ")),
+        area,
     );
 }
 
