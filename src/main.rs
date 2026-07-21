@@ -248,7 +248,7 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                 help_visible,
             } => {
                 if *floating {
-                    let is_detach = key.code == KeyCode::Char('o')
+                    let is_detach = key.code == KeyCode::Char('g')
                         && key.modifiers.contains(KeyModifiers::CONTROL);
                     if is_detach {
                         *floating = false;
@@ -522,7 +522,7 @@ Grid
 
 Floating terminal
   (typing)            forwarded to the session
-  ctrl+o              back to the grid
+  ctrl+g              back to the grid
 
 ?                     toggle this help, any key closes it";
 
@@ -547,9 +547,9 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
 fn draw_floating(frame: &mut Frame, dir: &str, session: &Session) {
     let area = frame.area();
     let title = if session.status() == SessionStatus::Crashed {
-        format!(" {dir} — session ended — Ctrl+O: back to grid ")
+        format!(" {dir} — session ended — Ctrl+G: back to grid ")
     } else {
-        format!(" {dir} — Ctrl+O: back to grid ")
+        format!(" {dir} — Ctrl+G: back to grid ")
     };
     let block = Block::bordered().title(title);
     let inner = block.inner(area);
