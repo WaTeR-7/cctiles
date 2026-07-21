@@ -512,22 +512,24 @@ fn draw_help(frame: &mut Frame) {
     let area = centered_rect(64, 15, frame.area());
     frame.render_widget(ratatui::widgets::Clear, area);
 
-    let text = "\
-Grid
-  hjkl / arrow keys   move focus
-  enter               open the focused session full-screen
-  r                   restart the focused tile's session
-  x                   kill the focused tile's session
-  q                   quit
-
-Floating terminal
-  (typing)            forwarded to the session
-  ctrl+g              back to the grid
-
-?                     toggle this help, any key closes it";
+    let lines = vec![
+        Line::from("Grid"),
+        Line::from("  hjkl / arrow keys   move focus"),
+        Line::from("  enter               open the focused session full-screen"),
+        Line::from("  r                   restart the focused tile's session"),
+        Line::from("  x                   kill the focused tile's session"),
+        Line::from("  ?                   toggle this help"),
+        Line::from("  q                   quit"),
+        Line::from(""),
+        Line::from("Floating terminal"),
+        Line::from("  (typing)            forwarded to the session"),
+        Line::from("  ctrl+g              back to the grid"),
+        Line::from(""),
+        Line::from("Press any key to close").alignment(ratatui::layout::Alignment::Center),
+    ];
 
     frame.render_widget(
-        Paragraph::new(text).block(Block::bordered().title(" Keybindings ")),
+        Paragraph::new(lines).block(Block::bordered().title(" Keybindings ")),
         area,
     );
 }
