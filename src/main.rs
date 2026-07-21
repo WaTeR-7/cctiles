@@ -201,6 +201,21 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                 KeyCode::Right | KeyCode::Char('l') => {
                     focused.1 = (focused.1 + 1).min(config.cols - 1);
                 }
+                KeyCode::Char('r') => {
+                    let index = focused.0 * config.cols + focused.1;
+                    if let Some(slot) = sessions.get_mut(index) {
+                        *slot = None;
+                        if let Some(dir) = config.tile_dirs.get(index) {
+                            *slot = Session::spawn(dir).ok();
+                        }
+                    }
+                }
+                KeyCode::Char('x') => {
+                    let index = focused.0 * config.cols + focused.1;
+                    if let Some(slot) = sessions.get_mut(index) {
+                        *slot = None;
+                    }
+                }
                 _ => {}
             },
         }
@@ -267,7 +282,10 @@ fn draw_grid(
     sessions: &[Option<Session>],
     focused: (usize, usize),
 ) {
-    let rows = Layout::vertical(vec![Constraint::Fill(1); config.rows]).split(frame.area());
+    let [grid_area, help_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+
+    let rows = Layout::vertical(vec![Constraint::Fill(1); config.rows]).split(grid_area);
 
     for (row_index, row_area) in rows.iter().enumerate() {
         let cols = Layout::horizontal(vec![Constraint::Fill(1); config.cols]).split(*row_area);
@@ -278,11 +296,11 @@ fn draw_grid(
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let failed = matches!(sessions.get(dir_index), Some(None));
-            let title = if failed {
-                format!(" {dir} [failed to start] ")
-            } else {
+            let has_session = matches!(sessions.get(dir_index), Some(Some(_)));
+            let title = if has_session {
                 format!(" {dir} ")
+            } else {
+                format!(" {dir} [no session] ")
             };
             let mut block = Block::bordered().title(title);
             if (row_index, col_index) == focused {
@@ -291,4 +309,9 @@ fn draw_grid(
             frame.render_widget(block, *tile_area);
         }
     }
+
+    frame.render_widget(
+        Paragraph::new("hjkl/arrows: move   r: restart tile   x: kill tile   q: quit"),
+        help_area,
+    );
 }
