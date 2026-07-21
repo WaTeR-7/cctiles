@@ -32,8 +32,7 @@ enum AppState {
         rows: u16,
         cols: u16,
         dirs: Vec<String>,
-        current: usize,
-        input: String,
+        active: usize,
     },
     Grid {
         config: Config,
@@ -102,9 +101,8 @@ fn run(mut terminal: DefaultTerminal) -> io::Result<()> {
                     state = AppState::TileDirs {
                         rows: *rows,
                         cols: *cols,
-                        dirs: vec![String::new(); tile_count],
-                        current: 0,
-                        input: default_dir(),
+                        dirs: vec![default_dir(); tile_count],
+                        active: 0,
                     };
                 }
                 _ => {}
@@ -113,29 +111,24 @@ fn run(mut terminal: DefaultTerminal) -> io::Result<()> {
                 rows,
                 cols,
                 dirs,
-                current,
-                input,
+                active,
             } => match key.code {
                 KeyCode::Esc => return Ok(()),
+                KeyCode::Up => *active = active.saturating_sub(1),
+                KeyCode::Down => *active = (*active + 1).min(dirs.len() - 1),
                 KeyCode::Backspace => {
-                    input.pop();
+                    dirs[*active].pop();
                 }
-                KeyCode::Char(c) => input.push(c),
+                KeyCode::Char(c) => dirs[*active].push(c),
                 KeyCode::Enter => {
-                    dirs[*current] = input.clone();
-                    if *current + 1 < dirs.len() {
-                        *current += 1;
-                        *input = default_dir();
-                    } else {
-                        state = AppState::Grid {
-                            config: Config {
-                                rows: *rows as usize,
-                                cols: *cols as usize,
-                                tile_dirs: dirs.clone(),
-                            },
-                            focused: (0, 0),
-                        };
-                    }
+                    state = AppState::Grid {
+                        config: Config {
+                            rows: *rows as usize,
+                            cols: *cols as usize,
+                            tile_dirs: dirs.clone(),
+                        },
+                        focused: (0, 0),
+                    };
                 }
                 _ => {}
             },
@@ -159,12 +152,8 @@ fn draw(frame: &mut Frame, state: &AppState) {
     match state {
         AppState::GridSize { rows, cols, field } => draw_grid_size(frame, *rows, *cols, field),
         AppState::TileDirs {
-            rows,
-            cols,
-            current,
-            input,
-            ..
-        } => draw_tile_dirs(frame, *rows, *cols, *current, input),
+            cols, dirs, active, ..
+        } => draw_tile_dirs(frame, *cols, dirs, *active),
         AppState::Grid { config, focused } => draw_grid(frame, config, *focused),
     }
 }
@@ -189,16 +178,22 @@ fn draw_grid_size(frame: &mut Frame, rows: u16, cols: u16, field: &SizeField) {
     );
 }
 
-fn draw_tile_dirs(frame: &mut Frame, rows: u16, cols: u16, current: usize, input: &str) {
-    let row = current / cols as usize;
-    let col = current % cols as usize;
-    let total = rows as usize * cols as usize;
-    let text = format!(
-        "cctiles setup\n\nWorking directory for tile {row},{col} ({}/{total})\n\n> {input}_\n\nType a path, Enter to confirm, Esc to quit",
-        current + 1
+fn draw_tile_dirs(frame: &mut Frame, cols: u16, dirs: &[String], active: usize) {
+    let mut lines = vec!["cctiles setup".to_string(), String::new()];
+    for (index, dir) in dirs.iter().enumerate() {
+        let row = index / cols as usize;
+        let col = index % cols as usize;
+        let marker = if index == active { ">" } else { " " };
+        let cursor = if index == active { "_" } else { "" };
+        lines.push(format!("{marker} Tile {row},{col}: {dir}{cursor}"));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Up/Down: switch tile   Type: edit path   Enter: confirm all   Esc: quit".to_string(),
     );
+
     frame.render_widget(
-        Paragraph::new(text).block(Block::bordered().title(" Tile directories ")),
+        Paragraph::new(lines.join("\n")).block(Block::bordered().title(" Tile directories ")),
         frame.area(),
     );
 }
