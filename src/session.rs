@@ -3,6 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::activity;
+use crate::transcript::TranscriptWatcher;
+
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
@@ -11,6 +14,7 @@ pub struct Session {
     #[allow(dead_code)]
     master: Box<dyn MasterPty + Send>,
     screen: Arc<Mutex<vt100::Parser>>,
+    transcript: TranscriptWatcher,
 }
 
 impl Session {
@@ -56,10 +60,13 @@ impl Session {
             }
         });
 
+        let transcript = TranscriptWatcher::start(dir);
+
         Ok(Session {
             child,
             master: pair.master,
             screen,
+            transcript,
         })
     }
 
@@ -69,6 +76,10 @@ impl Session {
             .lock()
             .map(|parser| parser.screen().contents())
             .unwrap_or_default()
+    }
+
+    pub fn activity_summary(&self) -> String {
+        activity::summarize(&self.transcript.lines())
     }
 }
 

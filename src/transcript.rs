@@ -29,7 +29,6 @@ impl TranscriptWatcher {
         Self { lines }
     }
 
-    #[allow(dead_code)]
     pub fn lines(&self) -> Vec<String> {
         self.lines.lock().map(|l| l.clone()).unwrap_or_default()
     }
