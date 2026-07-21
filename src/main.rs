@@ -1,3 +1,4 @@
+mod activity;
 mod config;
 mod session;
 #[allow(dead_code)] // not wired into the app yet; that's #17/#18's job
