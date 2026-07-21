@@ -9,6 +9,13 @@ use crate::transcript::TranscriptWatcher;
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
+/// Text Claude Code's CLI renders when a tool call needs approval (verified
+/// against a real permission prompt while investigating #19). The
+/// transcript's .jsonl doesn't record the tool_use until *after* it's
+/// approved, so this state can't be detected from the transcript at all -
+/// it has to be read off the rendered screen instead.
+const PERMISSION_PROMPT_MARKER: &str = "Do you want to proceed?";
+
 pub struct Session {
     child: Box<dyn Child + Send + Sync>,
     #[allow(dead_code)]
@@ -70,7 +77,6 @@ impl Session {
         })
     }
 
-    #[allow(dead_code)]
     pub fn screen_contents(&self) -> String {
         self.screen
             .lock()
@@ -83,8 +89,9 @@ impl Session {
     }
 
     pub fn status(&self) -> SessionStatus {
-        let lines = self.transcript.lines();
-        if activity::is_waiting_for_answer(&lines) {
+        if self.screen_contents().contains(PERMISSION_PROMPT_MARKER) {
+            SessionStatus::WaitingForPermission
+        } else if activity::is_waiting_for_answer(&self.transcript.lines()) {
             SessionStatus::WaitingForAnswer
         } else {
             SessionStatus::Normal
@@ -93,11 +100,11 @@ impl Session {
 }
 
 /// A session's status as relevant to the grid's status highlighting.
-/// `WaitingForPermission` will join this once #19 is resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
     Normal,
     WaitingForAnswer,
+    WaitingForPermission,
 }
 
 impl Drop for Session {
@@ -182,5 +189,24 @@ mod tests {
         assert_eq!(status, SessionStatus::WaitingForAnswer);
 
         let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn status_reflects_waiting_for_permission() {
+        let dir = std::env::temp_dir();
+        let session = Session::spawn_command(
+            "bash",
+            &["-c", "printf 'Do you want to proceed?\\n'; sleep 5"],
+            dir.to_str().expect("temp dir path should be valid utf-8"),
+        )
+        .expect("failed to spawn test session");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut status = session.status();
+        while Instant::now() < deadline && status != SessionStatus::WaitingForPermission {
+            std::thread::sleep(Duration::from_millis(50));
+            status = session.status();
+        }
+        assert_eq!(status, SessionStatus::WaitingForPermission);
     }
 }

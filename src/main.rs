@@ -334,7 +334,10 @@ fn draw_grid(
                 Some(None) => ("[no session]".to_string(), None),
                 None => (String::new(), None),
             };
-            let border_color = if status == Some(SessionStatus::WaitingForAnswer) {
+            let border_color = if matches!(
+                status,
+                Some(SessionStatus::WaitingForAnswer) | Some(SessionStatus::WaitingForPermission)
+            ) {
                 Some(Color::Red)
             } else if (row_index, col_index) == focused {
                 Some(Color::Yellow)
