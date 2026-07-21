@@ -75,9 +75,22 @@ fn watch_loop(project_dir: PathBuf, lines: Arc<Mutex<Vec<String>>>) {
         return;
     }
 
-    for event in rx {
-        if matches!(event.kind, EventKind::Modify(_)) {
-            drain_new_lines(&mut file, &mut carry, &lines);
+    // Drive draining off both notify events and a periodic fallback tick,
+    // since inotify-backed watching has been observed to occasionally miss
+    // or delay events in some (e.g. containerized CI) environments. The
+    // fallback tick means new content still gets picked up within roughly
+    // POLL_INTERVAL even if the event-driven path fails silently.
+    const POLL_INTERVAL: Duration = Duration::from_millis(300);
+    loop {
+        match rx.recv_timeout(POLL_INTERVAL) {
+            Ok(event) if matches!(event.kind, EventKind::Modify(_)) => {
+                drain_new_lines(&mut file, &mut carry, &lines);
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                drain_new_lines(&mut file, &mut carry, &lines);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
