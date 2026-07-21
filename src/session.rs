@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::activity;
 use crate::transcript::TranscriptWatcher;
 
 const ROWS: u16 = 24;
@@ -122,7 +121,7 @@ impl Session {
     }
 
     pub fn activity_summary(&self) -> String {
-        activity::summarize(&self.transcript.lines())
+        self.transcript.activity_summary()
     }
 
     /// Whether the child process is still running. Checked with a
@@ -139,7 +138,7 @@ impl Session {
             SessionStatus::Crashed
         } else if self.screen_contents().contains(PERMISSION_PROMPT_MARKER) {
             SessionStatus::WaitingForPermission
-        } else if activity::is_waiting_for_answer(&self.transcript.lines()) {
+        } else if self.transcript.is_waiting_for_answer() {
             SessionStatus::WaitingForAnswer
         } else {
             SessionStatus::Normal

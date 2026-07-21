@@ -6,14 +6,21 @@ use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-/// Streams newly appended lines from a Claude Code session's `.jsonl`
-/// transcript, located by convention at
-/// `~/.claude/projects/<cwd with '/' replaced by '-'>/<session-id>.jsonl`.
-/// The session id isn't known in advance, so this waits for a `.jsonl`
-/// file to appear in that directory and picks the most recently modified
-/// one.
+use crate::activity::ActivityState;
+
+/// Watches a Claude Code session's `.jsonl` transcript, located by
+/// convention at `~/.claude/projects/<cwd with '/' replaced by '-'>/
+/// <session-id>.jsonl`, and maintains a cached `ActivityState` from it. The
+/// session id isn't known in advance, so this waits for a `.jsonl` file to
+/// appear in that directory and picks the most recently modified one.
+///
+/// The cache is updated incrementally on a background thread as new lines
+/// are drained, so reading a session's current activity (called on every
+/// redraw) is a cheap lock+read instead of re-parsing the whole
+/// accumulated transcript each time - the latter used to scale badly with
+/// how long a session had been running (see #54).
 pub struct TranscriptWatcher {
-    lines: Arc<Mutex<Vec<String>>>,
+    activity: Arc<Mutex<ActivityState>>,
 }
 
 impl TranscriptWatcher {
@@ -22,15 +29,25 @@ impl TranscriptWatcher {
     }
 
     fn start_in(projects_root: PathBuf, cwd: &str) -> Self {
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let lines_for_thread = Arc::clone(&lines);
+        let activity = Arc::new(Mutex::new(ActivityState::default()));
+        let activity_for_thread = Arc::clone(&activity);
         let project_dir = projects_root.join(sanitize_cwd(cwd));
-        std::thread::spawn(move || watch_loop(project_dir, lines_for_thread));
-        Self { lines }
+        std::thread::spawn(move || watch_loop(project_dir, activity_for_thread));
+        Self { activity }
     }
 
-    pub fn lines(&self) -> Vec<String> {
-        self.lines.lock().map(|l| l.clone()).unwrap_or_default()
+    pub fn activity_summary(&self) -> String {
+        self.activity
+            .lock()
+            .map(|state| state.summary())
+            .unwrap_or_else(|_| "Idle".to_string())
+    }
+
+    pub fn is_waiting_for_answer(&self) -> bool {
+        self.activity
+            .lock()
+            .map(|state| state.is_waiting_for_answer())
+            .unwrap_or(false)
     }
 }
 
@@ -46,7 +63,7 @@ fn sanitize_cwd(cwd: &str) -> String {
         .collect()
 }
 
-fn watch_loop(project_dir: PathBuf, lines: Arc<Mutex<Vec<String>>>) {
+fn watch_loop(project_dir: PathBuf, activity: Arc<Mutex<ActivityState>>) {
     let Some(file_path) = wait_for_jsonl_file(&project_dir) else {
         return;
     };
@@ -55,7 +72,7 @@ fn watch_loop(project_dir: PathBuf, lines: Arc<Mutex<Vec<String>>>) {
     };
 
     let mut carry = Vec::new();
-    drain_new_lines(&mut file, &mut carry, &lines);
+    drain_new_lines(&mut file, &mut carry, &activity);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let Ok(mut watcher) = RecommendedWatcher::new(
@@ -84,11 +101,11 @@ fn watch_loop(project_dir: PathBuf, lines: Arc<Mutex<Vec<String>>>) {
     loop {
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(event) if matches!(event.kind, EventKind::Modify(_)) => {
-                drain_new_lines(&mut file, &mut carry, &lines);
+                drain_new_lines(&mut file, &mut carry, &activity);
             }
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                drain_new_lines(&mut file, &mut carry, &lines);
+                drain_new_lines(&mut file, &mut carry, &activity);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -120,23 +137,29 @@ fn wait_for_jsonl_file(project_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Reads whatever is newly available on `file` (its cursor naturally picks
-/// up where the previous read left off), and pushes each complete line to
-/// `lines`, carrying over any trailing partial line for next time.
-fn drain_new_lines(file: &mut File, carry: &mut Vec<u8>, lines: &Arc<Mutex<Vec<String>>>) {
+/// up where the previous read left off) and feeds each complete line into
+/// `activity`, carrying over any trailing partial line for next time.
+fn drain_new_lines(file: &mut File, carry: &mut Vec<u8>, activity: &Arc<Mutex<ActivityState>>) {
     let mut buf = Vec::new();
     if file.read_to_end(&mut buf).is_err() || buf.is_empty() {
         return;
     }
     carry.extend_from_slice(&buf);
 
+    let mut new_lines = Vec::new();
     while let Some(newline_pos) = carry.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = carry.drain(..=newline_pos).collect();
         let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]).into_owned();
-        if !line.is_empty()
-            && let Ok(mut guard) = lines.lock()
-        {
-            guard.push(line);
+        if !line.is_empty() {
+            new_lines.push(line);
         }
+    }
+    if new_lines.is_empty() {
+        return;
+    }
+
+    if let Ok(mut state) = activity.lock() {
+        state.update(&new_lines);
     }
 }
 
@@ -147,6 +170,17 @@ mod tests {
 
     use super::*;
 
+    fn assistant_text(text: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+            },
+        })
+        .to_string()
+    }
+
     #[test]
     fn streams_lines_appended_after_the_watcher_starts() {
         let projects_root =
@@ -156,7 +190,7 @@ mod tests {
         std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
 
         let jsonl_path = project_dir.join("session-abc.jsonl");
-        std::fs::write(&jsonl_path, "{\"line\":\"initial\"}\n")
+        std::fs::write(&jsonl_path, assistant_text("initial message") + "\n")
             .expect("failed to write initial line");
 
         let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
@@ -164,10 +198,10 @@ mod tests {
         // Give the watcher a moment to discover the file and pick up the
         // line that was already there before it started watching.
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && watcher.lines().is_empty() {
+        while Instant::now() < deadline && watcher.activity_summary() == "Idle" {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(watcher.lines(), vec!["{\"line\":\"initial\"}".to_string()]);
+        assert_eq!(watcher.activity_summary(), "initial message");
 
         // Now append a second line and confirm it streams in too.
         {
@@ -175,23 +209,15 @@ mod tests {
                 .append(true)
                 .open(&jsonl_path)
                 .expect("failed to open for append");
-            writeln!(file, "{{\"line\":\"appended\"}}").expect("failed to append line");
+            writeln!(file, "{}", assistant_text("appended message"))
+                .expect("failed to append line");
         }
 
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut lines = watcher.lines();
-        while Instant::now() < deadline && lines.len() < 2 {
+        while Instant::now() < deadline && watcher.activity_summary() != "appended message" {
             std::thread::sleep(Duration::from_millis(50));
-            lines = watcher.lines();
         }
-
-        assert_eq!(
-            lines,
-            vec![
-                "{\"line\":\"initial\"}".to_string(),
-                "{\"line\":\"appended\"}".to_string(),
-            ]
-        );
+        assert_eq!(watcher.activity_summary(), "appended message");
 
         let _ = std::fs::remove_dir_all(&projects_root);
     }
