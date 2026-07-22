@@ -514,10 +514,18 @@ fn draw_grid(
             // feed of it rather than just the latest line (see #61) - drop
             // everything but the tail that fits the tile's actual height,
             // since Paragraph itself would otherwise clip from the bottom
-            // and hide the newest lines instead of the oldest ones.
+            // and hide the newest lines instead of the oldest ones. Each
+            // entry gets a blank line under it (except the last) since a
+            // dense wall of one-liners with no separation was hard to read.
             let available_rows = (inner_area.height as usize).saturating_sub(body_lines.len());
-            let start = activity_lines.len().saturating_sub(available_rows);
-            body_lines.extend(activity_lines[start..].iter().cloned().map(Line::from));
+            let max_entries = available_rows.div_ceil(2);
+            let start = activity_lines.len().saturating_sub(max_entries);
+            for (i, line) in activity_lines[start..].iter().enumerate() {
+                if i > 0 {
+                    body_lines.push(Line::from(""));
+                }
+                body_lines.push(Line::from(line.clone()));
+            }
 
             frame.render_widget(
                 Paragraph::new(body_lines).wrap(ratatui::widgets::Wrap { trim: true }),

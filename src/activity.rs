@@ -56,8 +56,12 @@ impl ActivityState {
         }
     }
 
+    /// Pushes a new feed entry, collapsing any embedded newlines first -
+    /// e.g. a `Bash` call with no `description` falls back to showing its
+    /// (possibly multi-line) `command`, which would otherwise render as a
+    /// stray line break in the middle of what's meant to be one feed entry.
     fn push(&mut self, line: String) {
-        self.lines.push_back(line);
+        self.lines.push_back(line.replace(['\n', '\r'], " "));
         while self.lines.len() > MAX_LINES {
             self.lines.pop_front();
         }
@@ -217,6 +221,22 @@ mod tests {
             assistant_tool_use("toolu_1", "Bash", serde_json::json!({"command": "ls"})),
         ];
         assert_eq!(lines_of(&lines), vec!["Running: ls"]);
+    }
+
+    #[test]
+    fn embedded_newlines_in_a_multiline_bash_command_are_collapsed() {
+        let lines = vec![assistant_tool_use(
+            "toolu_1",
+            "Bash",
+            serde_json::json!({"command": "mkdir -p /tmp/foo\ncat > /tmp/foo/bar << 'EOF'"}),
+        )];
+        let result = lines_of(&lines);
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].contains('\n'));
+        assert_eq!(
+            result[0],
+            "Running: mkdir -p /tmp/foo cat > /tmp/foo/bar << 'EOF'"
+        );
     }
 
     #[test]
