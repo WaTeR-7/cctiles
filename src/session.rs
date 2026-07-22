@@ -3,17 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::hooks::HookServer;
 use crate::transcript::TranscriptWatcher;
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
-
-/// Text Claude Code's CLI renders when a tool call needs approval (verified
-/// against a real permission prompt while investigating #19). The
-/// transcript's .jsonl doesn't record the tool_use until *after* it's
-/// approved, so this state can't be detected from the transcript at all -
-/// it has to be read off the rendered screen instead.
-const PERMISSION_PROMPT_MARKER: &str = "Do you want to proceed?";
 
 pub struct Session {
     child: Mutex<Box<dyn Child + Send + Sync>>,
@@ -21,14 +15,25 @@ pub struct Session {
     writer: Mutex<Box<dyn Write + Send>>,
     screen: Arc<Mutex<vt100::Parser>>,
     transcript: TranscriptWatcher,
+    /// Live status fed by Claude Code's own hooks (see `hooks.rs`), or
+    /// `None` for sessions spawned without a `HookServer` (only test
+    /// sessions that don't run the real `claude` binary and so never fire
+    /// any hooks).
+    hook_status: Option<Arc<Mutex<SessionStatus>>>,
 }
 
 impl Session {
-    pub fn spawn(dir: &str) -> anyhow::Result<Self> {
-        Self::spawn_command("claude", &[], dir)
+    pub fn spawn(dir: &str, hooks: &HookServer) -> anyhow::Result<Self> {
+        let settings_path = hooks.settings_path().to_string_lossy().into_owned();
+        Self::spawn_command("claude", &["--settings", &settings_path], dir, Some(hooks))
     }
 
-    fn spawn_command(program: &str, args: &[&str], dir: &str) -> anyhow::Result<Self> {
+    fn spawn_command(
+        program: &str,
+        args: &[&str],
+        dir: &str,
+        hooks: Option<&HookServer>,
+    ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows: ROWS,
@@ -68,6 +73,7 @@ impl Session {
         });
 
         let transcript = TranscriptWatcher::start(dir);
+        let hook_status = hooks.map(|hooks| hooks.register(dir));
 
         Ok(Session {
             child: Mutex::new(child),
@@ -75,14 +81,8 @@ impl Session {
             writer: Mutex::new(writer),
             screen,
             transcript,
+            hook_status,
         })
-    }
-
-    pub fn screen_contents(&self) -> String {
-        self.screen
-            .lock()
-            .map(|parser| parser.screen().contents())
-            .unwrap_or_default()
     }
 
     /// Gives read-only access to the session's live vt100 screen buffer, for
@@ -135,23 +135,27 @@ impl Session {
 
     pub fn status(&self) -> SessionStatus {
         if !self.is_alive() {
-            SessionStatus::Crashed
-        } else if self.screen_contents().contains(PERMISSION_PROMPT_MARKER) {
-            SessionStatus::WaitingForPermission
-        } else if self.transcript.is_waiting_for_answer() {
-            SessionStatus::WaitingForAnswer
-        } else {
-            SessionStatus::Normal
+            return SessionStatus::Crashed;
         }
+        self.hook_status
+            .as_ref()
+            .and_then(|state| state.lock().ok().map(|status| *status))
+            .unwrap_or(SessionStatus::Idle)
     }
 }
 
-/// A session's status as relevant to the grid's status highlighting.
+/// A session's status as relevant to the grid's status highlighting, driven
+/// by Claude Code's own hooks (see `hooks.rs`) rather than by scraping the
+/// rendered screen or re-deriving state from the transcript - see #57.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
-    Normal,
+    Idle,
+    Working,
     WaitingForAnswer,
     WaitingForPermission,
+    /// A backgrounded shell task (`run_in_background`) is still running
+    /// after the turn that started it has already ended.
+    BackgroundTaskRunning,
     /// The child process exited (crashed or otherwise) without being
     /// deliberately killed via 'x' - see #26.
     Crashed,
@@ -169,7 +173,16 @@ impl Drop for Session {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use serde_json::json;
+
     use super::*;
+    use crate::hooks::post_hook_event;
+
+    fn screen_contents(session: &Session) -> String {
+        session
+            .with_screen(|screen| screen.contents())
+            .unwrap_or_default()
+    }
 
     #[test]
     fn screen_buffer_reflects_child_output() {
@@ -178,13 +191,14 @@ mod tests {
             "bash",
             &["-c", "printf 'hello-vt100-test\\n'; sleep 2"],
             dir.to_str().expect("temp dir path should be valid utf-8"),
+            None,
         )
         .expect("failed to spawn test session");
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut contents = String::new();
         while Instant::now() < deadline {
-            contents = session.screen_contents();
+            contents = screen_contents(&session);
             if contents.contains("hello-vt100-test") {
                 break;
             }
@@ -198,68 +212,115 @@ mod tests {
     }
 
     #[test]
-    fn status_reflects_waiting_for_answer() {
+    fn status_defaults_to_idle_without_a_hook_server() {
+        let dir = std::env::temp_dir();
+        let session =
+            Session::spawn_command("bash", &["-c", "sleep 2"], dir.to_str().unwrap(), None)
+                .expect("failed to spawn test session");
+        assert_eq!(session.status(), SessionStatus::Idle);
+    }
+
+    /// Simulates the hook lifecycle a real turn produces (see #57's live
+    /// capture): a `UserPromptSubmit` marks the session as working, a
+    /// `PreToolUse` for `AskUserQuestion` means it's now blocked on an
+    /// interactive answer, and a `PermissionRequest` means it's blocked on a
+    /// permission prompt instead.
+    #[test]
+    fn status_follows_hook_events_for_working_answer_and_permission() {
         let scratch_dir =
-            std::env::temp_dir().join(format!("cctiles-status-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("cctiles-hook-status-test-{}", std::process::id()));
         std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
         let dir_str = scratch_dir
             .to_str()
             .expect("scratch dir path should be valid utf-8");
 
-        let session = Session::spawn_command("bash", &["-c", "sleep 5"], dir_str)
+        let hooks = HookServer::start().expect("failed to start hook server");
+        let session = Session::spawn_command("bash", &["-c", "sleep 5"], dir_str, Some(&hooks))
             .expect("failed to spawn test session");
-        assert_eq!(session.status(), SessionStatus::Normal);
+        assert_eq!(session.status(), SessionStatus::Idle);
 
-        let sanitized: String = dir_str
-            .chars()
-            .map(|c| if c == '/' { '-' } else { c })
-            .collect();
-        let project_dir = directories::BaseDirs::new()
-            .expect("should be able to determine home dir")
-            .home_dir()
-            .join(".claude")
-            .join("projects")
-            .join(&sanitized);
-        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
+        post_hook_event(
+            hooks.port(),
+            &json!({"hook_event_name": "UserPromptSubmit", "cwd": dir_str}),
+        );
+        assert_eq!(
+            wait_for_status(&session, SessionStatus::Working),
+            SessionStatus::Working
+        );
 
-        let line = serde_json::json!({
-            "type": "assistant",
-            "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_x", "name": "AskUserQuestion", "input": {}}
-            ]},
-        })
-        .to_string();
-        std::fs::write(project_dir.join("fake-session.jsonl"), line + "\n")
-            .expect("failed to write fake transcript");
+        post_hook_event(
+            hooks.port(),
+            &json!({"hook_event_name": "PreToolUse", "cwd": dir_str, "tool_name": "AskUserQuestion"}),
+        );
+        assert_eq!(
+            wait_for_status(&session, SessionStatus::WaitingForAnswer),
+            SessionStatus::WaitingForAnswer
+        );
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut status = session.status();
-        while Instant::now() < deadline && status != SessionStatus::WaitingForAnswer {
-            std::thread::sleep(Duration::from_millis(50));
-            status = session.status();
-        }
-        assert_eq!(status, SessionStatus::WaitingForAnswer);
+        post_hook_event(
+            hooks.port(),
+            &json!({"hook_event_name": "PermissionRequest", "cwd": dir_str}),
+        );
+        assert_eq!(
+            wait_for_status(&session, SessionStatus::WaitingForPermission),
+            SessionStatus::WaitingForPermission
+        );
 
-        let _ = std::fs::remove_dir_all(&project_dir);
+        let _ = std::fs::remove_dir_all(&scratch_dir);
     }
 
+    /// A `Stop` with a non-empty `background_tasks` array (an undocumented
+    /// field confirmed via a live capture in #57) means a backgrounded shell
+    /// is still running even though the turn ended; an empty array means the
+    /// session is genuinely idle.
     #[test]
-    fn status_reflects_waiting_for_permission() {
-        let dir = std::env::temp_dir();
-        let session = Session::spawn_command(
-            "bash",
-            &["-c", "printf 'Do you want to proceed?\\n'; sleep 5"],
-            dir.to_str().expect("temp dir path should be valid utf-8"),
-        )
-        .expect("failed to spawn test session");
+    fn status_distinguishes_background_task_running_from_idle_on_stop() {
+        let scratch_dir = std::env::temp_dir().join(format!(
+            "cctiles-hook-status-bg-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
+        let dir_str = scratch_dir
+            .to_str()
+            .expect("scratch dir path should be valid utf-8");
 
+        let hooks = HookServer::start().expect("failed to start hook server");
+        let session = Session::spawn_command("bash", &["-c", "sleep 5"], dir_str, Some(&hooks))
+            .expect("failed to spawn test session");
+
+        post_hook_event(
+            hooks.port(),
+            &json!({
+                "hook_event_name": "Stop",
+                "cwd": dir_str,
+                "background_tasks": [{"id": "abc", "status": "running"}],
+            }),
+        );
+        assert_eq!(
+            wait_for_status(&session, SessionStatus::BackgroundTaskRunning),
+            SessionStatus::BackgroundTaskRunning
+        );
+
+        post_hook_event(
+            hooks.port(),
+            &json!({"hook_event_name": "Stop", "cwd": dir_str, "background_tasks": []}),
+        );
+        assert_eq!(
+            wait_for_status(&session, SessionStatus::Idle),
+            SessionStatus::Idle
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch_dir);
+    }
+
+    fn wait_for_status(session: &Session, expected: SessionStatus) -> SessionStatus {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut status = session.status();
-        while Instant::now() < deadline && status != SessionStatus::WaitingForPermission {
-            std::thread::sleep(Duration::from_millis(50));
+        while Instant::now() < deadline && status != expected {
+            std::thread::sleep(Duration::from_millis(20));
             status = session.status();
         }
-        assert_eq!(status, SessionStatus::WaitingForPermission);
+        status
     }
 
     #[test]
@@ -269,6 +330,7 @@ mod tests {
             "bash",
             &["-c", "read line; printf 'got: %s\\n' \"$line\""],
             dir.to_str().expect("temp dir path should be valid utf-8"),
+            None,
         )
         .expect("failed to spawn test session");
 
@@ -279,7 +341,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut contents = String::new();
         while Instant::now() < deadline {
-            contents = session.screen_contents();
+            contents = screen_contents(&session);
             if contents.contains("got: hello") {
                 break;
             }
@@ -294,8 +356,9 @@ mod tests {
     #[test]
     fn resize_updates_the_screen_buffer_dimensions() {
         let dir = std::env::temp_dir();
-        let session = Session::spawn_command("bash", &["-c", "sleep 2"], dir.to_str().unwrap())
-            .expect("failed to spawn test session");
+        let session =
+            Session::spawn_command("bash", &["-c", "sleep 2"], dir.to_str().unwrap(), None)
+                .expect("failed to spawn test session");
 
         session.resize(40, 100).expect("failed to resize");
 
@@ -308,8 +371,9 @@ mod tests {
     #[test]
     fn status_reflects_a_process_that_has_exited() {
         let dir = std::env::temp_dir();
-        let session = Session::spawn_command("bash", &["-c", "exit 1"], dir.to_str().unwrap())
-            .expect("failed to spawn test session");
+        let session =
+            Session::spawn_command("bash", &["-c", "exit 1"], dir.to_str().unwrap(), None)
+                .expect("failed to spawn test session");
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut status = session.status();
@@ -327,6 +391,7 @@ mod tests {
             "cctiles-definitely-not-a-real-binary",
             &[],
             dir.to_str().expect("temp dir path should be valid utf-8"),
+            None,
         );
         assert!(result.is_err());
     }
