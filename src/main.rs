@@ -1,5 +1,6 @@
 mod activity;
 mod config;
+mod git_info;
 mod hooks;
 mod session;
 mod transcript;
@@ -458,7 +459,7 @@ fn draw_grid(
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let (summary, indicator_color) = match sessions.get(dir_index) {
+            let (summary, indicator_color, git_status) = match sessions.get(dir_index) {
                 Some(TileSession::Running(session)) => {
                     let status = session.status();
                     let summary = if status == SessionStatus::Crashed {
@@ -475,13 +476,13 @@ fn draw_grid(
                         SessionStatus::Working => Color::Green,
                         SessionStatus::Idle => Color::White,
                     };
-                    (summary, Some(color))
+                    (summary, Some(color), session.git_status_summary())
                 }
                 Some(TileSession::Failed(err)) => {
-                    (format!("Failed to start: {err}"), Some(Color::Red))
+                    (format!("Failed to start: {err}"), Some(Color::Red), None)
                 }
-                Some(TileSession::Empty) => ("[no session]".to_string(), None),
-                None => (String::new(), None),
+                Some(TileSession::Empty) => ("[no session]".to_string(), None, None),
+                None => (String::new(), None, None),
             };
             // The border is reserved for focus alone (a status color there
             // would fight with it, since a tile can be both focused and,
@@ -499,8 +500,16 @@ fn draw_grid(
             }
             let inner_area = block.inner(*tile_area);
             frame.render_widget(block, *tile_area);
+            let mut body_lines = Vec::new();
+            if let Some(git_status) = git_status {
+                body_lines.push(Line::from(Span::styled(
+                    git_status,
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            }
+            body_lines.push(Line::from(summary));
             frame.render_widget(
-                Paragraph::new(summary).wrap(ratatui::widgets::Wrap { trim: true }),
+                Paragraph::new(body_lines).wrap(ratatui::widgets::Wrap { trim: true }),
                 inner_area,
             );
         }
