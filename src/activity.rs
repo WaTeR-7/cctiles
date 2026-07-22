@@ -1,86 +1,75 @@
+use std::collections::VecDeque;
+
 use serde_json::Value;
 
-/// A running summary of a session's current activity, built by feeding it
+/// A live feed of a session's recent activity, built by feeding it
 /// transcript lines as they arrive (via `update`) rather than reprocessing
 /// the whole accumulated transcript on every call - doing that on every
 /// redraw (as this used to) meant navigation lag that scaled with how long
 /// a session had been running, since real transcripts can accumulate
 /// thousands of lines with large embedded tool outputs.
 ///
-/// Based on the format researched in #15: an `assistant` tool_use with no
-/// matching `user` tool_result yet means that tool is still running;
-/// otherwise the latest assistant text is shown.
+/// Each tool call and each assistant text block becomes its own entry, in
+/// the order they occurred. There's no need to reconcile a tool call with
+/// its later result (or keep unbounded history) - the tile just wants a
+/// live-scrolling feed of what's happening, not a precise record, so this
+/// caps how many entries it retains and lets the oldest fall off.
 #[derive(Debug, Default)]
 pub struct ActivityState {
-    pending: Vec<(String, PendingToolUse)>,
-    last_text: Option<String>,
+    lines: VecDeque<String>,
 }
 
-#[derive(Debug)]
-struct PendingToolUse {
-    name: String,
-    input: Value,
-}
+/// Comfortably more than any tile will ever be tall enough to show at
+/// once, while still bounding memory for a long-running session.
+const MAX_LINES: usize = 200;
 
 impl ActivityState {
-    /// Incorporates newly-appended transcript lines into the running state.
+    /// Incorporates newly-appended transcript lines into the running feed.
     /// Lines already seen must not be passed again.
     pub fn update(&mut self, new_lines: &[String]) {
         for line in new_lines {
             let Ok(entry) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
+            if entry.get("type").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
             let Some(content) = entry.pointer("/message/content").and_then(Value::as_array) else {
                 continue;
             };
 
-            match entry.get("type").and_then(Value::as_str) {
-                Some("assistant") => {
-                    for block in content {
-                        match block.get("type").and_then(Value::as_str) {
-                            Some("tool_use") => {
-                                let id = block.get("id").and_then(Value::as_str).unwrap_or("");
-                                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                                self.pending.push((
-                                    id.to_string(),
-                                    PendingToolUse {
-                                        name: name.to_string(),
-                                        input: block.get("input").cloned().unwrap_or(Value::Null),
-                                    },
-                                ));
-                            }
-                            Some("text") => {
-                                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                    self.last_text = Some(text.to_string());
-                                }
-                            }
-                            _ => {}
+            for block in content {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                        let input = block.get("input").cloned().unwrap_or(Value::Null);
+                        self.push(describe_tool_use(name, &input));
+                    }
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            self.push(truncate(text.trim(), 60));
                         }
                     }
+                    _ => {}
                 }
-                Some("user") => {
-                    for block in content {
-                        if block.get("type").and_then(Value::as_str) == Some("tool_result")
-                            && let Some(id) = block.get("tool_use_id").and_then(Value::as_str)
-                        {
-                            self.pending.retain(|(pending_id, _)| pending_id != id);
-                        }
-                    }
-                }
-                _ => {}
             }
         }
     }
 
-    /// A short, human-readable summary of what the session is currently
-    /// doing.
-    pub fn summary(&self) -> String {
-        match self.pending.last() {
-            Some((_, tool_use)) => describe_tool_use(&tool_use.name, &tool_use.input),
-            None => match &self.last_text {
-                Some(text) => truncate(text.trim(), 60),
-                None => "Idle".to_string(),
-            },
+    fn push(&mut self, line: String) {
+        self.lines.push_back(line);
+        while self.lines.len() > MAX_LINES {
+            self.lines.pop_front();
+        }
+    }
+
+    /// Recent activity, oldest first. The caller decides how many (from the
+    /// end) fit the space it has available.
+    pub fn recent_lines(&self) -> Vec<String> {
+        if self.lines.is_empty() {
+            vec!["Idle".to_string()]
+        } else {
+            self.lines.iter().cloned().collect()
         }
     }
 }
@@ -125,10 +114,10 @@ fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    fn summarize(lines: &[String]) -> String {
+    fn lines_of(lines: &[String]) -> Vec<String> {
         let mut state = ActivityState::default();
         state.update(lines);
-        state.summary()
+        state.recent_lines()
     }
 
     fn assistant_tool_use(id: &str, name: &str, input: Value) -> String {
@@ -165,13 +154,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_tool_use_shows_as_running() {
+    fn tool_use_shows_as_running() {
         let lines = vec![assistant_tool_use(
             "toolu_1",
             "Bash",
             serde_json::json!({"command": "cargo test", "description": "Run the test suite"}),
         )];
-        assert_eq!(summarize(&lines), "Running: Run the test suite");
+        assert_eq!(lines_of(&lines), vec!["Running: Run the test suite"]);
     }
 
     #[test]
@@ -181,11 +170,11 @@ mod tests {
             "Bash",
             serde_json::json!({"command": "cargo build"}),
         )];
-        assert_eq!(summarize(&lines), "Running: cargo build");
+        assert_eq!(lines_of(&lines), vec!["Running: cargo build"]);
     }
 
     #[test]
-    fn resolved_tool_use_falls_back_to_last_text() {
+    fn each_event_becomes_its_own_line_in_order() {
         let lines = vec![
             assistant_text("Let's get started."),
             assistant_tool_use(
@@ -196,12 +185,19 @@ mod tests {
             user_tool_result("toolu_1"),
             assistant_text("All done here."),
         ];
-        assert_eq!(summarize(&lines), "All done here.");
+        assert_eq!(
+            lines_of(&lines),
+            vec![
+                "Let's get started.".to_string(),
+                "Reading src/main.rs".to_string(),
+                "All done here.".to_string(),
+            ]
+        );
     }
 
     #[test]
     fn no_entries_at_all_is_idle() {
-        assert_eq!(summarize(&[]), "Idle");
+        assert_eq!(lines_of(&[]), vec!["Idle".to_string()]);
     }
 
     #[test]
@@ -211,7 +207,7 @@ mod tests {
             "Edit",
             serde_json::json!({"file_path": "src/config.rs", "old_string": "a", "new_string": "b"}),
         )];
-        assert_eq!(summarize(&lines), "Editing src/config.rs");
+        assert_eq!(lines_of(&lines), vec!["Editing src/config.rs"]);
     }
 
     #[test]
@@ -220,24 +216,38 @@ mod tests {
             "not json at all".to_string(),
             assistant_tool_use("toolu_1", "Bash", serde_json::json!({"command": "ls"})),
         ];
-        assert_eq!(summarize(&lines), "Running: ls");
+        assert_eq!(lines_of(&lines), vec!["Running: ls"]);
     }
 
     #[test]
-    fn update_called_across_separate_batches_matches_a_single_batch() {
-        // The whole point of ActivityState is to be fed new lines
-        // incrementally as they arrive, rather than reprocessing history -
-        // a tool_result arriving in a later batch must still resolve a
-        // tool_use pushed in an earlier one.
+    fn update_called_across_separate_batches_accumulates() {
         let mut state = ActivityState::default();
         state.update(&[assistant_tool_use(
             "toolu_1",
             "Bash",
             serde_json::json!({"command": "cargo test"}),
         )]);
-        assert_eq!(state.summary(), "Running: cargo test");
+        assert_eq!(state.recent_lines(), vec!["Running: cargo test"]);
 
         state.update(&[user_tool_result("toolu_1"), assistant_text("Tests passed.")]);
-        assert_eq!(state.summary(), "Tests passed.");
+        assert_eq!(
+            state.recent_lines(),
+            vec![
+                "Running: cargo test".to_string(),
+                "Tests passed.".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn old_entries_fall_off_once_the_cap_is_exceeded() {
+        let mut state = ActivityState::default();
+        for i in 0..MAX_LINES + 10 {
+            state.update(&[assistant_text(&format!("message {i}"))]);
+        }
+        let lines = state.recent_lines();
+        assert_eq!(lines.len(), MAX_LINES);
+        assert_eq!(lines.first(), Some(&"message 10".to_string()));
+        assert_eq!(lines.last(), Some(&format!("message {}", MAX_LINES + 9)));
     }
 }

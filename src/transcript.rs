@@ -36,11 +36,11 @@ impl TranscriptWatcher {
         Self { activity }
     }
 
-    pub fn activity_summary(&self) -> String {
+    pub fn activity_lines(&self) -> Vec<String> {
         self.activity
             .lock()
-            .map(|state| state.summary())
-            .unwrap_or_else(|_| "Idle".to_string())
+            .map(|state| state.recent_lines())
+            .unwrap_or_else(|_| vec!["Idle".to_string()])
     }
 }
 
@@ -191,10 +191,13 @@ mod tests {
         // Give the watcher a moment to discover the file and pick up the
         // line that was already there before it started watching.
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && watcher.activity_summary() == "Idle" {
+        while Instant::now() < deadline && watcher.activity_lines() == vec!["Idle".to_string()] {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(watcher.activity_summary(), "initial message");
+        assert_eq!(
+            watcher.activity_lines(),
+            vec!["initial message".to_string()]
+        );
 
         // Now append a second line and confirm it streams in too.
         {
@@ -206,11 +209,15 @@ mod tests {
                 .expect("failed to append line");
         }
 
+        let expected = vec![
+            "initial message".to_string(),
+            "appended message".to_string(),
+        ];
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && watcher.activity_summary() != "appended message" {
+        while Instant::now() < deadline && watcher.activity_lines() != expected {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(watcher.activity_summary(), "appended message");
+        assert_eq!(watcher.activity_lines(), expected);
 
         let _ = std::fs::remove_dir_all(&projects_root);
     }
