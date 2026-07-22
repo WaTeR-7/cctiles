@@ -2,6 +2,7 @@
 
 # CC-Tiles
 
+[![crates.io](https://img.shields.io/crates/v/cctiles.svg)](https://crates.io/crates/cctiles)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![CI](https://github.com/WaTeR-7/cctiles/actions/workflows/ci.yml/badge.svg)](https://github.com/WaTeR-7/cctiles/actions/workflows/ci.yml)
 
@@ -27,7 +28,11 @@
 
 ## インストール
 
-まだ crates.io には公開していません。現時点ではソースからビルドしてください。
+```sh
+cargo install cctiles
+```
+
+または、ソースからビルドする場合:
 
 ```sh
 git clone https://github.com/WaTeR-7/cctiles.git

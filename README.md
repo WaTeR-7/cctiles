@@ -2,6 +2,7 @@
 
 # CC-Tiles
 
+[![crates.io](https://img.shields.io/crates/v/cctiles.svg)](https://crates.io/crates/cctiles)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![CI](https://github.com/WaTeR-7/cctiles/actions/workflows/ci.yml/badge.svg)](https://github.com/WaTeR-7/cctiles/actions/workflows/ci.yml)
 
@@ -27,7 +28,11 @@ Run `cctiles`, pick a grid layout and a directory for each pane, and each pane (
 
 ## Installation
 
-Not yet published to crates.io. For now, build from source:
+```sh
+cargo install cctiles
+```
+
+Or build from source:
 
 ```sh
 git clone https://github.com/WaTeR-7/cctiles.git
