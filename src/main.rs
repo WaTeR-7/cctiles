@@ -457,7 +457,7 @@ fn draw_grid(
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let (activity_lines, indicator_color, git_status) = match sessions.get(dir_index) {
+            let (activity_lines, indicator, git_status) = match sessions.get(dir_index) {
                 Some(TileSession::Running(session)) => {
                     let status = session.status();
                     let activity_lines = if status == SessionStatus::Crashed {
@@ -465,20 +465,24 @@ fn draw_grid(
                     } else {
                         session.activity_lines()
                     };
-                    let color = match status {
-                        SessionStatus::Crashed => Color::Red,
+                    let indicator = match status {
+                        SessionStatus::Crashed => ('!', Color::Red),
                         SessionStatus::WaitingForAnswer | SessionStatus::WaitingForPermission => {
-                            Color::Yellow
+                            ('?', Color::Yellow)
                         }
-                        SessionStatus::BackgroundTaskRunning => Color::Cyan,
-                        SessionStatus::Working => Color::Green,
-                        SessionStatus::Idle => Color::White,
+                        SessionStatus::BackgroundTaskRunning => ('●', Color::Cyan),
+                        SessionStatus::Working => ('●', Color::Green),
+                        SessionStatus::Idle => ('●', Color::White),
                     };
-                    (activity_lines, Some(color), session.git_status_summary())
+                    (
+                        activity_lines,
+                        Some(indicator),
+                        session.git_status_summary(),
+                    )
                 }
                 Some(TileSession::Failed(err)) => (
                     vec![format!("Failed to start: {err}")],
-                    Some(Color::Red),
+                    Some(('!', Color::Red)),
                     None,
                 ),
                 Some(TileSession::Empty) => (vec!["[no session]".to_string()], None, None),
@@ -487,10 +491,13 @@ fn draw_grid(
             // The border is reserved for focus alone (a status color there
             // would fight with it, since a tile can be both focused and,
             // say, waiting for permission at once - see #57). Session state
-            // instead shows as a colored indicator dot in the title.
+            // instead shows as a colored indicator glyph in the title - a
+            // distinct shape (not just color) for states that need the
+            // user's attention, so they stand out at a glance rather than
+            // just being "the same dot in a different hue".
             let mut title_spans = vec![Span::raw(" ")];
-            if let Some(color) = indicator_color {
-                title_spans.push(Span::styled("●", Style::default().fg(color)));
+            if let Some((glyph, color)) = indicator {
+                title_spans.push(Span::styled(glyph.to_string(), Style::default().fg(color)));
                 title_spans.push(Span::raw(" "));
             }
             title_spans.push(Span::raw(format!("{dir} ")));
