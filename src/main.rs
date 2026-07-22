@@ -517,6 +517,14 @@ fn draw_grid(
             // and hide the newest lines instead of the oldest ones. Each
             // entry gets a blank line under it (except the last) since a
             // dense wall of one-liners with no separation was hard to read.
+            //
+            // This budget assumes one terminal row per logical `Line`, so
+            // wrapping is deliberately not enabled below: entries are
+            // already truncated to a short, fixed length, and letting a
+            // rare overlong one wrap would silently eat extra rows the
+            // budget doesn't know about, pushing the newest entries (at the
+            // bottom) off the bottom of the tile instead of just clipping
+            // that one line.
             let available_rows = (inner_area.height as usize).saturating_sub(body_lines.len());
             let max_entries = available_rows.div_ceil(2);
             let start = activity_lines.len().saturating_sub(max_entries);
@@ -527,10 +535,7 @@ fn draw_grid(
                 body_lines.push(Line::from(line.clone()));
             }
 
-            frame.render_widget(
-                Paragraph::new(body_lines).wrap(ratatui::widgets::Wrap { trim: true }),
-                inner_area,
-            );
+            frame.render_widget(Paragraph::new(body_lines), inner_area);
         }
     }
 
