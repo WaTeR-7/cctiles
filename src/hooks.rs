@@ -6,7 +6,21 @@ use serde_json::{Value, json};
 
 use crate::session::SessionStatus;
 
-type Registry = Arc<Mutex<HashMap<String, Arc<Mutex<SessionStatus>>>>>;
+/// The two pieces of shared state a registered tile's hook events feed: its
+/// live status, and (once a turn has actually happened) the exact path of
+/// its *current* transcript file - taken directly from the hook payload's
+/// own `transcript_path` field rather than guessed from the directory,
+/// since that also correctly follows a mid-session switch to a *different*
+/// file, which happens if the user runs `/resume` in the floating terminal
+/// to continue an earlier session instead of the fresh one cctiles started
+/// (see #74).
+#[derive(Clone)]
+pub struct Registration {
+    pub status: Arc<Mutex<SessionStatus>>,
+    pub transcript_path: Arc<Mutex<Option<PathBuf>>>,
+}
+
+type Registry = Arc<Mutex<HashMap<String, Registration>>>;
 
 /// Runs a local HTTP server that Claude Code's own hooks mechanism POSTs to,
 /// and turns those events into a live `SessionStatus` per tile - replacing
@@ -72,16 +86,19 @@ impl HookServer {
     }
 
     /// Registers a tile's working directory so incoming hook events whose
-    /// `cwd` matches it get routed to the returned status handle. Spawning a
-    /// new session for the same `dir` re-registers and replaces the old
-    /// handle, which is fine - the old one is only reachable from the
+    /// `cwd` matches it get routed to the returned handles. Spawning a new
+    /// session for the same `dir` re-registers and replaces the old
+    /// registration, which is fine - the old one is only reachable from the
     /// `Session` that's being replaced anyway.
-    pub fn register(&self, dir: &str) -> Arc<Mutex<SessionStatus>> {
-        let state = Arc::new(Mutex::new(SessionStatus::Idle));
+    pub fn register(&self, dir: &str) -> Registration {
+        let registration = Registration {
+            status: Arc::new(Mutex::new(SessionStatus::Idle)),
+            transcript_path: Arc::new(Mutex::new(None)),
+        };
         if let Ok(mut map) = self.registry.lock() {
-            map.insert(dir.to_string(), Arc::clone(&state));
+            map.insert(dir.to_string(), registration.clone());
         }
-        state
+        registration
     }
 }
 
@@ -105,6 +122,11 @@ fn handle_request(mut request: tiny_http::Request, registry: &Registry) {
 /// - `Stop` means the turn ended - genuinely idle unless its
 ///   `background_tasks` array (an undocumented but real field) is non-empty,
 ///   in which case a backgrounded shell is still running unattended.
+///
+/// Also records the event's `transcript_path` (a universal payload field)
+/// every time, independent of which event fired - this is what lets the
+/// transcript watcher follow whichever file the session is *actually*
+/// currently writing to, including after a `/resume` switch (#74).
 fn apply_event(value: &Value, registry: &Registry) {
     let Some(cwd) = value.get("cwd").and_then(Value::as_str) else {
         return;
@@ -112,10 +134,17 @@ fn apply_event(value: &Value, registry: &Registry) {
     let Some(event) = value.get("hook_event_name").and_then(Value::as_str) else {
         return;
     };
-    let Some(state) = registry.lock().ok().and_then(|map| map.get(cwd).cloned()) else {
+    let Some(registration) = registry.lock().ok().and_then(|map| map.get(cwd).cloned()) else {
         return;
     };
-    let Ok(mut status) = state.lock() else {
+
+    if let Some(path) = value.get("transcript_path").and_then(Value::as_str)
+        && let Ok(mut current) = registration.transcript_path.lock()
+    {
+        *current = Some(PathBuf::from(path));
+    }
+
+    let Ok(mut status) = registration.status.lock() else {
         return;
     };
 
@@ -192,15 +221,29 @@ mod tests {
             .lock()
             .ok()?
             .get(dir)
-            .and_then(|state| state.lock().ok().map(|s| *s))
+            .and_then(|registration| registration.status.lock().ok().map(|s| *s))
+    }
+
+    fn transcript_path_of(registry: &Registry, dir: &str) -> Option<PathBuf> {
+        registry
+            .lock()
+            .ok()?
+            .get(dir)?
+            .transcript_path
+            .lock()
+            .ok()?
+            .clone()
     }
 
     fn registry_with(dir: &str, initial: SessionStatus) -> Registry {
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
-        registry
-            .lock()
-            .unwrap()
-            .insert(dir.to_string(), Arc::new(Mutex::new(initial)));
+        registry.lock().unwrap().insert(
+            dir.to_string(),
+            Registration {
+                status: Arc::new(Mutex::new(initial)),
+                transcript_path: Arc::new(Mutex::new(None)),
+            },
+        );
         registry
     }
 
@@ -313,8 +356,8 @@ mod tests {
     fn http_server_delivers_events_end_to_end() {
         let server = HookServer::start().expect("failed to start hook server");
         let dir = "/tmp/cctiles-hooks-e2e-test";
-        let state = server.register(dir);
-        assert_eq!(*state.lock().unwrap(), SessionStatus::Idle);
+        let registration = server.register(dir);
+        assert_eq!(*registration.status.lock().unwrap(), SessionStatus::Idle);
 
         post_hook_event(
             server.port(),
@@ -322,12 +365,52 @@ mod tests {
         );
 
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut status = *state.lock().unwrap();
+        let mut status = *registration.status.lock().unwrap();
         while Instant::now() < deadline && status != SessionStatus::Working {
             std::thread::sleep(Duration::from_millis(20));
-            status = *state.lock().unwrap();
+            status = *registration.status.lock().unwrap();
         }
         assert_eq!(status, SessionStatus::Working);
+    }
+
+    /// The transcript path must be captured regardless of which hook fires,
+    /// and updated again to a different path if a later event reports one,
+    /// as happens after `/resume` switches the session to a different past
+    /// conversation (see #74).
+    #[test]
+    fn transcript_path_is_captured_and_updated_from_hook_events() {
+        let registry = registry_with("/proj", SessionStatus::Idle);
+        assert_eq!(transcript_path_of(&registry, "/proj"), None);
+
+        apply_event(
+            &event(
+                "UserPromptSubmit",
+                "/proj",
+                json!({"transcript_path": "/home/user/.claude/projects/-proj/session-a.jsonl"}),
+            ),
+            &registry,
+        );
+        assert_eq!(
+            transcript_path_of(&registry, "/proj"),
+            Some(PathBuf::from(
+                "/home/user/.claude/projects/-proj/session-a.jsonl"
+            ))
+        );
+
+        apply_event(
+            &event(
+                "UserPromptSubmit",
+                "/proj",
+                json!({"transcript_path": "/home/user/.claude/projects/-proj/session-b.jsonl"}),
+            ),
+            &registry,
+        );
+        assert_eq!(
+            transcript_path_of(&registry, "/proj"),
+            Some(PathBuf::from(
+                "/home/user/.claude/projects/-proj/session-b.jsonl"
+            ))
+        );
     }
 
     #[test]
