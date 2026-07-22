@@ -9,6 +9,8 @@ A terminal UI (TUI) application for running and monitoring multiple [Claude Code
 
 Run `cctiles`, pick a grid layout and a directory for each pane, and each pane (a **tile**) spawns and runs its own Claude Code session. Every tile shows a live, at-a-glance summary of what its session is doing, so you can keep several agents working in parallel without switching between a pile of terminal tabs to check on them.
 
+![Demo of cctiles: a 2x2 grid of tiles showing live status indicators, git info, and a scrolling activity feed, then opening a floating terminal and the keybinding help overlay](docs/demo.gif)
+
 ## Features
 
 - **Grid of live sessions** - lay out any number of rows/columns; each tile runs its own `claude` process.
