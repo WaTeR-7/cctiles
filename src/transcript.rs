@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::os::unix::fs::MetadataExt;
@@ -13,7 +14,12 @@ use crate::activity::ActivityState;
 /// convention at `~/.claude/projects/<cwd with '/' replaced by '-'>/
 /// <session-id>.jsonl`, and maintains a cached `ActivityState` from it. The
 /// session id isn't known in advance, so this waits for a `.jsonl` file to
-/// appear in that directory and picks the most recently modified one.
+/// appear in that directory - specifically one that didn't already exist
+/// when watching started, since a directory that's been used before
+/// already has leftover `.jsonl` files from earlier sessions, and grabbing
+/// whichever one happens to be newest at that instant would - before this
+/// session's own file exists yet - just latch onto stale, unrelated
+/// content and never reconsider (see #72).
 ///
 /// The cache is updated incrementally on a background thread as new lines
 /// are drained, so reading a session's current activity (called on every
@@ -58,7 +64,8 @@ fn sanitize_cwd(cwd: &str) -> String {
 }
 
 fn watch_loop(project_dir: PathBuf, activity: Arc<Mutex<ActivityState>>) {
-    let Some(file_path) = wait_for_jsonl_file(&project_dir) else {
+    let pre_existing = jsonl_files_in(&project_dir);
+    let Some(file_path) = wait_for_new_jsonl_file(&project_dir, &pre_existing) else {
         return;
     };
     let Ok(mut file) = File::open(&file_path) else {
@@ -106,25 +113,37 @@ fn watch_loop(project_dir: PathBuf, activity: Arc<Mutex<ActivityState>>) {
     }
 }
 
-/// Waits (polling) for a `.jsonl` file to show up in `project_dir` and
-/// returns the most recently modified one. Runs on a dedicated background
-/// thread, so blocking here is fine.
-fn wait_for_jsonl_file(project_dir: &Path) -> Option<PathBuf> {
-    loop {
-        if let Ok(entries) = std::fs::read_dir(project_dir) {
-            let mut candidates: Vec<PathBuf> = entries
+fn jsonl_files_in(project_dir: &Path) -> HashSet<PathBuf> {
+    std::fs::read_dir(project_dir)
+        .map(|entries| {
+            entries
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
                 .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-                .collect();
-            candidates.sort_by_key(|path| {
-                std::fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-            });
-            if let Some(newest) = candidates.pop() {
-                return Some(newest);
-            }
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Waits (polling) for a `.jsonl` file to show up in `project_dir` that
+/// wasn't already present in `pre_existing` - i.e. this session's own
+/// transcript, as opposed to a leftover from an earlier session in the same
+/// directory. If more than one shows up (shouldn't normally happen for a
+/// single session), picks the most recently modified. Runs on a dedicated
+/// background thread, so blocking here is fine.
+fn wait_for_new_jsonl_file(project_dir: &Path, pre_existing: &HashSet<PathBuf>) -> Option<PathBuf> {
+    loop {
+        let mut candidates: Vec<PathBuf> = jsonl_files_in(project_dir)
+            .into_iter()
+            .filter(|path| !pre_existing.contains(path))
+            .collect();
+        candidates.sort_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+        });
+        if let Some(newest) = candidates.pop() {
+            return Some(newest);
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -214,16 +233,18 @@ mod tests {
             std::env::temp_dir().join(format!("cctiles-transcript-test-{}", std::process::id()));
         let cwd = "/fake/project/dir";
         let project_dir = projects_root.join(sanitize_cwd(cwd));
-        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
 
+        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
+
+        // The project directory and the session's own file don't exist yet
+        // when the watcher starts - they show up a moment later, same as a
+        // real `claude` process starting up.
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
         let jsonl_path = project_dir.join("session-abc.jsonl");
         std::fs::write(&jsonl_path, assistant_text("initial message") + "\n")
             .expect("failed to write initial line");
 
-        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
-
-        // Give the watcher a moment to discover the file and pick up the
-        // line that was already there before it started watching.
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline && watcher.activity_lines() == vec!["Idle".to_string()] {
             std::thread::sleep(Duration::from_millis(50));
@@ -256,6 +277,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&projects_root);
     }
 
+    /// A directory that's been used with Claude Code before already has
+    /// leftover `.jsonl` files from earlier, unrelated sessions sitting in
+    /// it before this session's own file is ever created. The watcher must
+    /// not mistake one of those for this session's transcript, no matter how
+    /// large or how it compares by mtime (see #72).
+    #[test]
+    fn ignores_a_pre_existing_jsonl_file_from_an_earlier_session() {
+        let projects_root = std::env::temp_dir().join(format!(
+            "cctiles-transcript-decoy-test-{}",
+            std::process::id()
+        ));
+        let cwd = "/fake/decoy/project";
+        let project_dir = projects_root.join(sanitize_cwd(cwd));
+        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
+
+        // A leftover from an earlier session, already sitting in the
+        // directory before this session's watcher even starts.
+        let decoy_path = project_dir.join("old-session.jsonl");
+        std::fs::write(
+            &decoy_path,
+            assistant_text("stale unrelated content") + "\n",
+        )
+        .expect("failed to write decoy file");
+
+        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
+
+        // Give the watcher plenty of opportunity to (incorrectly) latch
+        // onto the decoy if it were going to.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            watcher.activity_lines(),
+            vec!["Idle".to_string()],
+            "must not have picked up the pre-existing decoy file"
+        );
+
+        // This session's own file shows up later, as it would once the
+        // real `claude` process finishes starting up.
+        let jsonl_path = project_dir.join("new-session.jsonl");
+        std::fs::write(&jsonl_path, assistant_text("real session content") + "\n")
+            .expect("failed to write the new session's transcript");
+
+        let lines = wait_until_last_line_is(&watcher, "real session content");
+        assert_eq!(lines, vec!["real session content".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&projects_root);
+    }
+
     fn wait_until_last_line_is(watcher: &TranscriptWatcher, expected_last: &str) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut lines = watcher.activity_lines();
@@ -278,13 +346,15 @@ mod tests {
         ));
         let cwd = "/fake/replaced/project";
         let project_dir = projects_root.join(sanitize_cwd(cwd));
-        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
 
+        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
+
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
         let jsonl_path = project_dir.join("session-abc.jsonl");
         std::fs::write(&jsonl_path, assistant_text("before replace") + "\n")
             .expect("failed to write initial line");
 
-        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
         let lines = wait_until_last_line_is(&watcher, "before replace");
         assert_eq!(lines.last(), Some(&"before replace".to_string()));
 
@@ -313,8 +383,11 @@ mod tests {
         ));
         let cwd = "/fake/truncated/project";
         let project_dir = projects_root.join(sanitize_cwd(cwd));
-        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
 
+        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
+
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
         let jsonl_path = project_dir.join("session-abc.jsonl");
         std::fs::write(
             &jsonl_path,
@@ -322,7 +395,6 @@ mod tests {
         )
         .expect("failed to write initial line");
 
-        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
         let lines = wait_until_last_line_is(&watcher, "a fairly long message before truncation");
         assert_eq!(
             lines.last(),
