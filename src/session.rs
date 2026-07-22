@@ -124,8 +124,8 @@ impl Session {
         Ok(())
     }
 
-    pub fn activity_summary(&self) -> String {
-        self.transcript.activity_summary()
+    pub fn activity_lines(&self) -> Vec<String> {
+        self.transcript.activity_lines()
     }
 
     /// The current branch and working-tree diffstat (e.g. `"main  +3/-1"`),

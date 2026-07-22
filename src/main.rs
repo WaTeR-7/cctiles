@@ -459,13 +459,13 @@ fn draw_grid(
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let (summary, indicator_color, git_status) = match sessions.get(dir_index) {
+            let (activity_lines, indicator_color, git_status) = match sessions.get(dir_index) {
                 Some(TileSession::Running(session)) => {
                     let status = session.status();
-                    let summary = if status == SessionStatus::Crashed {
-                        "Session ended unexpectedly. Press 'r' to restart.".to_string()
+                    let activity_lines = if status == SessionStatus::Crashed {
+                        vec!["Session ended unexpectedly. Press 'r' to restart.".to_string()]
                     } else {
-                        session.activity_summary()
+                        session.activity_lines()
                     };
                     let color = match status {
                         SessionStatus::Crashed => Color::Red,
@@ -476,13 +476,15 @@ fn draw_grid(
                         SessionStatus::Working => Color::Green,
                         SessionStatus::Idle => Color::White,
                     };
-                    (summary, Some(color), session.git_status_summary())
+                    (activity_lines, Some(color), session.git_status_summary())
                 }
-                Some(TileSession::Failed(err)) => {
-                    (format!("Failed to start: {err}"), Some(Color::Red), None)
-                }
-                Some(TileSession::Empty) => ("[no session]".to_string(), None, None),
-                None => (String::new(), None, None),
+                Some(TileSession::Failed(err)) => (
+                    vec![format!("Failed to start: {err}")],
+                    Some(Color::Red),
+                    None,
+                ),
+                Some(TileSession::Empty) => (vec!["[no session]".to_string()], None, None),
+                None => (Vec::new(), None, None),
             };
             // The border is reserved for focus alone (a status color there
             // would fight with it, since a tile can be both focused and,
@@ -500,6 +502,7 @@ fn draw_grid(
             }
             let inner_area = block.inner(*tile_area);
             frame.render_widget(block, *tile_area);
+
             let mut body_lines = Vec::new();
             if let Some(git_status) = git_status {
                 body_lines.push(Line::from(Span::styled(
@@ -507,7 +510,23 @@ fn draw_grid(
                     Style::default().add_modifier(Modifier::DIM),
                 )));
             }
-            body_lines.push(Line::from(summary));
+            // Only the most recent activity fits, so show a live-scrolling
+            // feed of it rather than just the latest line (see #61) - drop
+            // everything but the tail that fits the tile's actual height,
+            // since Paragraph itself would otherwise clip from the bottom
+            // and hide the newest lines instead of the oldest ones. Each
+            // entry gets a blank line under it (except the last) since a
+            // dense wall of one-liners with no separation was hard to read.
+            let available_rows = (inner_area.height as usize).saturating_sub(body_lines.len());
+            let max_entries = available_rows.div_ceil(2);
+            let start = activity_lines.len().saturating_sub(max_entries);
+            for (i, line) in activity_lines[start..].iter().enumerate() {
+                if i > 0 {
+                    body_lines.push(Line::from(""));
+                }
+                body_lines.push(Line::from(line.clone()));
+            }
+
             frame.render_widget(
                 Paragraph::new(body_lines).wrap(ratatui::widgets::Wrap { trim: true }),
                 inner_area,

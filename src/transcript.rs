@@ -1,5 +1,6 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,11 +37,11 @@ impl TranscriptWatcher {
         Self { activity }
     }
 
-    pub fn activity_summary(&self) -> String {
+    pub fn activity_lines(&self) -> Vec<String> {
         self.activity
             .lock()
-            .map(|state| state.summary())
-            .unwrap_or_else(|_| "Idle".to_string())
+            .map(|state| state.recent_lines())
+            .unwrap_or_else(|_| vec!["Idle".to_string()])
     }
 }
 
@@ -65,7 +66,7 @@ fn watch_loop(project_dir: PathBuf, activity: Arc<Mutex<ActivityState>>) {
     };
 
     let mut carry = Vec::new();
-    drain_new_lines(&mut file, &mut carry, &activity);
+    drain_new_lines(&mut file, &file_path, &mut carry, &activity);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let Ok(mut watcher) = RecommendedWatcher::new(
@@ -94,11 +95,11 @@ fn watch_loop(project_dir: PathBuf, activity: Arc<Mutex<ActivityState>>) {
     loop {
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(event) if matches!(event.kind, EventKind::Modify(_)) => {
-                drain_new_lines(&mut file, &mut carry, &activity);
+                drain_new_lines(&mut file, &file_path, &mut carry, &activity);
             }
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                drain_new_lines(&mut file, &mut carry, &activity);
+                drain_new_lines(&mut file, &file_path, &mut carry, &activity);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -132,7 +133,14 @@ fn wait_for_jsonl_file(project_dir: &Path) -> Option<PathBuf> {
 /// Reads whatever is newly available on `file` (its cursor naturally picks
 /// up where the previous read left off) and feeds each complete line into
 /// `activity`, carrying over any trailing partial line for next time.
-fn drain_new_lines(file: &mut File, carry: &mut Vec<u8>, activity: &Arc<Mutex<ActivityState>>) {
+fn drain_new_lines(
+    file: &mut File,
+    file_path: &Path,
+    carry: &mut Vec<u8>,
+    activity: &Arc<Mutex<ActivityState>>,
+) {
+    reopen_if_replaced(file, file_path, carry);
+
     let mut buf = Vec::new();
     if file.read_to_end(&mut buf).is_err() || buf.is_empty() {
         return;
@@ -153,6 +161,32 @@ fn drain_new_lines(file: &mut File, carry: &mut Vec<u8>, activity: &Arc<Mutex<Ac
 
     if let Ok(mut state) = activity.lock() {
         state.update(&new_lines);
+    }
+}
+
+/// If `file_path` no longer refers to the file we currently have open (e.g.
+/// a context-compaction rewrite replaced or truncated it), `file`'s cursor
+/// can end up sitting past the real end of the new content - `read_to_end`
+/// from there just returns nothing forever, which otherwise makes a tile's
+/// activity feed silently freeze partway through a long session. Detected
+/// via the inode changing (a full replace) or the on-disk length dropping
+/// below where we've already read up to (an in-place truncate), and
+/// recovered by reopening fresh from the same path.
+fn reopen_if_replaced(file: &mut File, file_path: &Path, carry: &mut Vec<u8>) {
+    let Ok(on_disk) = std::fs::metadata(file_path) else {
+        return;
+    };
+    let Ok(open) = file.metadata() else {
+        return;
+    };
+    let Ok(cursor) = file.stream_position() else {
+        return;
+    };
+
+    let replaced = on_disk.ino() != open.ino() || on_disk.len() < cursor;
+    if replaced && let Ok(reopened) = File::open(file_path) {
+        *file = reopened;
+        carry.clear();
     }
 }
 
@@ -191,10 +225,13 @@ mod tests {
         // Give the watcher a moment to discover the file and pick up the
         // line that was already there before it started watching.
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && watcher.activity_summary() == "Idle" {
+        while Instant::now() < deadline && watcher.activity_lines() == vec!["Idle".to_string()] {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(watcher.activity_summary(), "initial message");
+        assert_eq!(
+            watcher.activity_lines(),
+            vec!["initial message".to_string()]
+        );
 
         // Now append a second line and confirm it streams in too.
         {
@@ -206,11 +243,104 @@ mod tests {
                 .expect("failed to append line");
         }
 
+        let expected = vec![
+            "initial message".to_string(),
+            "appended message".to_string(),
+        ];
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && watcher.activity_summary() != "appended message" {
+        while Instant::now() < deadline && watcher.activity_lines() != expected {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(watcher.activity_summary(), "appended message");
+        assert_eq!(watcher.activity_lines(), expected);
+
+        let _ = std::fs::remove_dir_all(&projects_root);
+    }
+
+    fn wait_until_last_line_is(watcher: &TranscriptWatcher, expected_last: &str) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut lines = watcher.activity_lines();
+        while Instant::now() < deadline && lines.last().map(String::as_str) != Some(expected_last) {
+            std::thread::sleep(Duration::from_millis(50));
+            lines = watcher.activity_lines();
+        }
+        lines
+    }
+
+    /// A context-compaction rewrite (or similar) can replace the transcript
+    /// file at the same path with an unrelated new one (a different inode).
+    /// Without detecting that, the watcher's already-open handle would just
+    /// look permanently quiet, since nothing writes to the old inode anymore.
+    #[test]
+    fn recovers_after_the_transcript_file_is_replaced_with_a_new_inode() {
+        let projects_root = std::env::temp_dir().join(format!(
+            "cctiles-transcript-replace-test-{}",
+            std::process::id()
+        ));
+        let cwd = "/fake/replaced/project";
+        let project_dir = projects_root.join(sanitize_cwd(cwd));
+        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
+
+        let jsonl_path = project_dir.join("session-abc.jsonl");
+        std::fs::write(&jsonl_path, assistant_text("before replace") + "\n")
+            .expect("failed to write initial line");
+
+        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
+        let lines = wait_until_last_line_is(&watcher, "before replace");
+        assert_eq!(lines.last(), Some(&"before replace".to_string()));
+
+        // Remove the file and create a brand new one at the same path (a
+        // different inode), as if it had been replaced out from under the
+        // watcher.
+        std::fs::remove_file(&jsonl_path).expect("failed to remove file");
+        std::fs::write(&jsonl_path, assistant_text("after replace") + "\n")
+            .expect("failed to write replacement file");
+
+        let lines = wait_until_last_line_is(&watcher, "after replace");
+        assert_eq!(lines.last(), Some(&"after replace".to_string()));
+
+        let _ = std::fs::remove_dir_all(&projects_root);
+    }
+
+    /// An in-place truncate (same inode, shorter content) is a distinct
+    /// failure mode from a full replace - the cursor ends up past the new
+    /// end of file instead of pointing at an inode nothing writes to
+    /// anymore - so this needs its own coverage.
+    #[test]
+    fn recovers_after_the_transcript_file_is_truncated_in_place() {
+        let projects_root = std::env::temp_dir().join(format!(
+            "cctiles-transcript-truncate-test-{}",
+            std::process::id()
+        ));
+        let cwd = "/fake/truncated/project";
+        let project_dir = projects_root.join(sanitize_cwd(cwd));
+        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
+
+        let jsonl_path = project_dir.join("session-abc.jsonl");
+        std::fs::write(
+            &jsonl_path,
+            assistant_text("a fairly long message before truncation") + "\n",
+        )
+        .expect("failed to write initial line");
+
+        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
+        let lines = wait_until_last_line_is(&watcher, "a fairly long message before truncation");
+        assert_eq!(
+            lines.last(),
+            Some(&"a fairly long message before truncation".to_string())
+        );
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&jsonl_path)
+                .expect("failed to truncate transcript file");
+            writeln!(file, "{}", assistant_text("after truncate"))
+                .expect("failed to write truncated content");
+        }
+
+        let lines = wait_until_last_line_is(&watcher, "after truncate");
+        assert_eq!(lines.last(), Some(&"after truncate".to_string()));
 
         let _ = std::fs::remove_dir_all(&projects_root);
     }
