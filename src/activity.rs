@@ -47,7 +47,15 @@ impl ActivityState {
                     }
                     Some("text") => {
                         if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            self.push(truncate(text.trim(), 60));
+                            // Unlike the tool-use summaries above, this is
+                            // content the user actually wants to read in
+                            // full where space allows - a fixed char cap
+                            // would cut it regardless of how wide the tile
+                            // is. Since entries are never wrapped (see
+                            // #63/#65), an untruncated line still only ever
+                            // costs one row; the renderer clips it to
+                            // whatever fits the tile's actual width.
+                            self.push(text.trim().to_string());
                         }
                     }
                     _ => {}
@@ -175,6 +183,13 @@ mod tests {
             serde_json::json!({"command": "cargo build"}),
         )];
         assert_eq!(lines_of(&lines), vec!["Running: cargo build"]);
+    }
+
+    #[test]
+    fn assistant_text_is_not_truncated() {
+        let long_text = "a".repeat(200);
+        let lines = vec![assistant_text(&long_text)];
+        assert_eq!(lines_of(&lines), vec![long_text]);
     }
 
     #[test]
