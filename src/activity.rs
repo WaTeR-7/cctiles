@@ -86,13 +86,18 @@ impl ActivityState {
     }
 }
 
+/// None of these truncate their field to a fixed character count - like
+/// assistant text (see #69), a long command/pattern/description still only
+/// ever costs one row, since entries are never wrapped, so the renderer
+/// clips it to whatever fits the tile's actual width. Cutting it further
+/// upstream only threw away information a wide tile had room to show.
 fn describe_tool_use(name: &str, input: &Value) -> String {
     let field = |key: &str| input.get(key).and_then(Value::as_str);
 
     match name {
         "Bash" => field("description")
             .or_else(|| field("command"))
-            .map(|s| format!("Running: {}", truncate(s, 50)))
+            .map(|s| format!("Running: {s}"))
             .unwrap_or_else(|| "Running a command".to_string()),
         "Read" => field("file_path")
             .map(|p| format!("Reading {p}"))
@@ -104,21 +109,13 @@ fn describe_tool_use(name: &str, input: &Value) -> String {
             .map(|p| format!("Writing {p}"))
             .unwrap_or_else(|| "Writing a file".to_string()),
         "Grep" => field("pattern")
-            .map(|p| format!("Searching for {}", truncate(p, 40)))
+            .map(|p| format!("Searching for {p}"))
             .unwrap_or_else(|| "Searching".to_string()),
         "AskUserQuestion" => "Waiting for your answer".to_string(),
         "Agent" => field("description")
-            .map(|s| truncate(s, 60))
+            .map(str::to_string)
             .unwrap_or_else(|| "Running a subagent".to_string()),
         other => format!("Running: {other}"),
-    }
-}
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max_chars).collect::<String>())
     }
 }
 
@@ -190,6 +187,20 @@ mod tests {
         let long_text = "a".repeat(200);
         let lines = vec![assistant_text(&long_text)];
         assert_eq!(lines_of(&lines), vec![long_text]);
+    }
+
+    #[test]
+    fn long_bash_description_is_not_truncated() {
+        let long_description = "a".repeat(200);
+        let lines = vec![assistant_tool_use(
+            "toolu_1",
+            "Bash",
+            serde_json::json!({"command": "cargo test", "description": long_description}),
+        )];
+        assert_eq!(
+            lines_of(&lines),
+            vec![format!("Running: {long_description}")]
+        );
     }
 
     #[test]
