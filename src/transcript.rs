@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::os::unix::fs::MetadataExt;
@@ -10,16 +9,17 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::activity::ActivityState;
 
-/// Watches a Claude Code session's `.jsonl` transcript, located by
-/// convention at `~/.claude/projects/<cwd with '/' replaced by '-'>/
-/// <session-id>.jsonl`, and maintains a cached `ActivityState` from it. The
-/// session id isn't known in advance, so this waits for a `.jsonl` file to
-/// appear in that directory - specifically one that didn't already exist
-/// when watching started, since a directory that's been used before
-/// already has leftover `.jsonl` files from earlier sessions, and grabbing
-/// whichever one happens to be newest at that instant would - before this
-/// session's own file exists yet - just latch onto stale, unrelated
-/// content and never reconsider (see #72).
+/// Watches a Claude Code session's `.jsonl` transcript and maintains a
+/// cached `ActivityState` from it. Which file to watch isn't known in
+/// advance - it's supplied later via `transcript_path`, populated from the
+/// `transcript_path` field of the session's own hook events (see
+/// `hooks.rs`) once its first turn actually happens. Following the hooks'
+/// own report of the current file, rather than guessing from the directory
+/// (e.g. "whichever `.jsonl` is newest"), also means this correctly follows
+/// a mid-session switch to a *different* file - which happens if the user
+/// runs `/resume` in the floating terminal to continue an earlier session
+/// instead of the fresh one cctiles started (see #74, and #72 for the
+/// directory-guessing approach this replaced).
 ///
 /// The cache is updated incrementally on a background thread as new lines
 /// are drained, so reading a session's current activity (called on every
@@ -31,15 +31,10 @@ pub struct TranscriptWatcher {
 }
 
 impl TranscriptWatcher {
-    pub fn start(cwd: &str) -> Self {
-        Self::start_in(claude_projects_dir(), cwd)
-    }
-
-    fn start_in(projects_root: PathBuf, cwd: &str) -> Self {
+    pub fn start(transcript_path: Arc<Mutex<Option<PathBuf>>>) -> Self {
         let activity = Arc::new(Mutex::new(ActivityState::default()));
         let activity_for_thread = Arc::clone(&activity);
-        let project_dir = projects_root.join(sanitize_cwd(cwd));
-        std::thread::spawn(move || watch_loop(project_dir, activity_for_thread));
+        std::thread::spawn(move || watch_loop(transcript_path, activity_for_thread));
         Self { activity }
     }
 
@@ -51,29 +46,63 @@ impl TranscriptWatcher {
     }
 }
 
-fn claude_projects_dir() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join(".claude").join("projects"))
-        .unwrap_or_default()
+fn watch_loop(transcript_path: Arc<Mutex<Option<PathBuf>>>, activity: Arc<Mutex<ActivityState>>) {
+    loop {
+        let Some(path) = wait_for_path(&transcript_path) else {
+            return;
+        };
+        watch_one_file(&path, &transcript_path, &activity);
+    }
 }
 
-fn sanitize_cwd(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| if c == '/' { '-' } else { c })
-        .collect()
+/// Blocks (polling) until `transcript_path` has a value, returning it. Only
+/// returns `None` if the lock is poisoned.
+fn wait_for_path(transcript_path: &Arc<Mutex<Option<PathBuf>>>) -> Option<PathBuf> {
+    loop {
+        match transcript_path.lock() {
+            Ok(guard) => {
+                if let Some(path) = guard.clone() {
+                    return Some(path);
+                }
+            }
+            Err(_) => return None,
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
-fn watch_loop(project_dir: PathBuf, activity: Arc<Mutex<ActivityState>>) {
-    let pre_existing = jsonl_files_in(&project_dir);
-    let Some(file_path) = wait_for_new_jsonl_file(&project_dir, &pre_existing) else {
-        return;
-    };
-    let Ok(mut file) = File::open(&file_path) else {
-        return;
+fn current_path(transcript_path: &Arc<Mutex<Option<PathBuf>>>) -> Option<PathBuf> {
+    transcript_path.lock().ok().and_then(|guard| guard.clone())
+}
+
+/// Follows a single transcript file until `transcript_path` reports a
+/// different one - i.e. until this session gets replaced or resumed to a
+/// different one - at which point this returns so `watch_loop` can start
+/// following the new one instead.
+fn watch_one_file(
+    file_path: &Path,
+    transcript_path: &Arc<Mutex<Option<PathBuf>>>,
+    activity: &Arc<Mutex<ActivityState>>,
+) {
+    // Fresh state for whichever session we're now following - stale
+    // entries from a previous file (before a `/resume` switch) would
+    // otherwise linger mixed in with the new one's.
+    if let Ok(mut state) = activity.lock() {
+        *state = ActivityState::default();
+    }
+
+    let mut file = loop {
+        if current_path(transcript_path).as_deref() != Some(file_path) {
+            return;
+        }
+        if let Ok(file) = File::open(file_path) {
+            break file;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     };
 
     let mut carry = Vec::new();
-    drain_new_lines(&mut file, &file_path, &mut carry, &activity);
+    drain_new_lines(&mut file, file_path, &mut carry, activity);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let Ok(mut watcher) = RecommendedWatcher::new(
@@ -87,7 +116,7 @@ fn watch_loop(project_dir: PathBuf, activity: Arc<Mutex<ActivityState>>) {
         return;
     };
     if watcher
-        .watch(&file_path, RecursiveMode::NonRecursive)
+        .watch(file_path, RecursiveMode::NonRecursive)
         .is_err()
     {
         return;
@@ -97,55 +126,24 @@ fn watch_loop(project_dir: PathBuf, activity: Arc<Mutex<ActivityState>>) {
     // since inotify-backed watching has been observed to occasionally miss
     // or delay events in some (e.g. containerized CI) environments. The
     // fallback tick means new content still gets picked up within roughly
-    // POLL_INTERVAL even if the event-driven path fails silently.
+    // POLL_INTERVAL even if the event-driven path fails silently; it also
+    // doubles as how quickly a `/resume` switch away from this file gets
+    // noticed.
     const POLL_INTERVAL: Duration = Duration::from_millis(300);
     loop {
+        if current_path(transcript_path).as_deref() != Some(file_path) {
+            return;
+        }
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(event) if matches!(event.kind, EventKind::Modify(_)) => {
-                drain_new_lines(&mut file, &file_path, &mut carry, &activity);
+                drain_new_lines(&mut file, file_path, &mut carry, activity);
             }
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                drain_new_lines(&mut file, &file_path, &mut carry, &activity);
+                drain_new_lines(&mut file, file_path, &mut carry, activity);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
-    }
-}
-
-fn jsonl_files_in(project_dir: &Path) -> HashSet<PathBuf> {
-    std::fs::read_dir(project_dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Waits (polling) for a `.jsonl` file to show up in `project_dir` that
-/// wasn't already present in `pre_existing` - i.e. this session's own
-/// transcript, as opposed to a leftover from an earlier session in the same
-/// directory. If more than one shows up (shouldn't normally happen for a
-/// single session), picks the most recently modified. Runs on a dedicated
-/// background thread, so blocking here is fine.
-fn wait_for_new_jsonl_file(project_dir: &Path, pre_existing: &HashSet<PathBuf>) -> Option<PathBuf> {
-    loop {
-        let mut candidates: Vec<PathBuf> = jsonl_files_in(project_dir)
-            .into_iter()
-            .filter(|path| !pre_existing.contains(path))
-            .collect();
-        candidates.sort_by_key(|path| {
-            std::fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .ok()
-        });
-        if let Some(newest) = candidates.pop() {
-            return Some(newest);
-        }
-        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -227,101 +225,13 @@ mod tests {
         .to_string()
     }
 
-    #[test]
-    fn streams_lines_appended_after_the_watcher_starts() {
-        let projects_root =
-            std::env::temp_dir().join(format!("cctiles-transcript-test-{}", std::process::id()));
-        let cwd = "/fake/project/dir";
-        let project_dir = projects_root.join(sanitize_cwd(cwd));
-
-        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
-
-        // The project directory and the session's own file don't exist yet
-        // when the watcher starts - they show up a moment later, same as a
-        // real `claude` process starting up.
-        std::thread::sleep(Duration::from_millis(100));
-        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
-        let jsonl_path = project_dir.join("session-abc.jsonl");
-        std::fs::write(&jsonl_path, assistant_text("initial message") + "\n")
-            .expect("failed to write initial line");
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && watcher.activity_lines() == vec!["Idle".to_string()] {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert_eq!(
-            watcher.activity_lines(),
-            vec!["initial message".to_string()]
-        );
-
-        // Now append a second line and confirm it streams in too.
-        {
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&jsonl_path)
-                .expect("failed to open for append");
-            writeln!(file, "{}", assistant_text("appended message"))
-                .expect("failed to append line");
-        }
-
-        let expected = vec![
-            "initial message".to_string(),
-            "appended message".to_string(),
-        ];
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && watcher.activity_lines() != expected {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert_eq!(watcher.activity_lines(), expected);
-
-        let _ = std::fs::remove_dir_all(&projects_root);
-    }
-
-    /// A directory that's been used with Claude Code before already has
-    /// leftover `.jsonl` files from earlier, unrelated sessions sitting in
-    /// it before this session's own file is ever created. The watcher must
-    /// not mistake one of those for this session's transcript, no matter how
-    /// large or how it compares by mtime (see #72).
-    #[test]
-    fn ignores_a_pre_existing_jsonl_file_from_an_earlier_session() {
-        let projects_root = std::env::temp_dir().join(format!(
-            "cctiles-transcript-decoy-test-{}",
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cctiles-transcript-test-{name}-{}",
             std::process::id()
         ));
-        let cwd = "/fake/decoy/project";
-        let project_dir = projects_root.join(sanitize_cwd(cwd));
-        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
-
-        // A leftover from an earlier session, already sitting in the
-        // directory before this session's watcher even starts.
-        let decoy_path = project_dir.join("old-session.jsonl");
-        std::fs::write(
-            &decoy_path,
-            assistant_text("stale unrelated content") + "\n",
-        )
-        .expect("failed to write decoy file");
-
-        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
-
-        // Give the watcher plenty of opportunity to (incorrectly) latch
-        // onto the decoy if it were going to.
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            watcher.activity_lines(),
-            vec!["Idle".to_string()],
-            "must not have picked up the pre-existing decoy file"
-        );
-
-        // This session's own file shows up later, as it would once the
-        // real `claude` process finishes starting up.
-        let jsonl_path = project_dir.join("new-session.jsonl");
-        std::fs::write(&jsonl_path, assistant_text("real session content") + "\n")
-            .expect("failed to write the new session's transcript");
-
-        let lines = wait_until_last_line_is(&watcher, "real session content");
-        assert_eq!(lines, vec!["real session content".to_string()]);
-
-        let _ = std::fs::remove_dir_all(&projects_root);
+        std::fs::create_dir_all(&dir).expect("failed to create scratch dir");
+        dir
     }
 
     fn wait_until_last_line_is(watcher: &TranscriptWatcher, expected_last: &str) -> Vec<String> {
@@ -334,27 +244,162 @@ mod tests {
         lines
     }
 
+    #[test]
+    fn stays_idle_until_a_transcript_path_is_reported() {
+        let transcript_path = Arc::new(Mutex::new(None));
+        let watcher = TranscriptWatcher::start(Arc::clone(&transcript_path));
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(watcher.activity_lines(), vec!["Idle".to_string()]);
+    }
+
+    #[test]
+    fn streams_lines_once_the_transcript_path_is_reported() {
+        let dir = scratch_dir("streams");
+        let jsonl_path = dir.join("session-abc.jsonl");
+
+        let transcript_path = Arc::new(Mutex::new(None));
+        let watcher = TranscriptWatcher::start(Arc::clone(&transcript_path));
+
+        // The path isn't known yet (no hook event has fired), same as a
+        // real session before its first turn.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(watcher.activity_lines(), vec!["Idle".to_string()]);
+
+        std::fs::write(&jsonl_path, assistant_text("initial message") + "\n")
+            .expect("failed to write initial line");
+        *transcript_path.lock().unwrap() = Some(jsonl_path.clone());
+
+        let lines = wait_until_last_line_is(&watcher, "initial message");
+        assert_eq!(lines, vec!["initial message".to_string()]);
+
+        // Now append a second line and confirm it streams in too.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&jsonl_path)
+                .expect("failed to open for append");
+            writeln!(file, "{}", assistant_text("appended message"))
+                .expect("failed to append line");
+        }
+
+        let lines = wait_until_last_line_is(&watcher, "appended message");
+        assert_eq!(
+            lines,
+            vec![
+                "initial message".to_string(),
+                "appended message".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that's been used with Claude Code before already has
+    /// leftover `.jsonl` files from earlier, unrelated sessions sitting in
+    /// it. Since the watcher only ever looks at the exact path it's told
+    /// about, a decoy sitting nearby (even one that looks "newer") is never
+    /// even considered (see #72).
+    #[test]
+    fn ignores_a_pre_existing_jsonl_file_it_was_never_told_about() {
+        let dir = scratch_dir("decoy");
+        let decoy_path = dir.join("old-session.jsonl");
+        std::fs::write(
+            &decoy_path,
+            assistant_text("stale unrelated content") + "\n",
+        )
+        .expect("failed to write decoy file");
+
+        let transcript_path = Arc::new(Mutex::new(None));
+        let watcher = TranscriptWatcher::start(Arc::clone(&transcript_path));
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            watcher.activity_lines(),
+            vec!["Idle".to_string()],
+            "must not have picked up the pre-existing decoy file"
+        );
+
+        let jsonl_path = dir.join("new-session.jsonl");
+        std::fs::write(&jsonl_path, assistant_text("real session content") + "\n")
+            .expect("failed to write the new session's transcript");
+        *transcript_path.lock().unwrap() = Some(jsonl_path);
+
+        let lines = wait_until_last_line_is(&watcher, "real session content");
+        assert_eq!(lines, vec!["real session content".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Simulates `/resume`: the session switches to writing a different,
+    /// already-existing file instead of the one it started with. The
+    /// watcher must follow the switch (not stay stuck on the old file) and
+    /// must not mix the old file's entries in with the new one's (see #74).
+    #[test]
+    fn follows_a_resume_switch_to_a_different_pre_existing_file() {
+        let dir = scratch_dir("resume");
+        let first_path = dir.join("session-first.jsonl");
+        std::fs::write(&first_path, assistant_text("from the fresh session") + "\n")
+            .expect("failed to write first session's transcript");
+
+        let resumed_path = dir.join("session-resumed.jsonl");
+        std::fs::write(
+            &resumed_path,
+            assistant_text("earlier turn from the resumed conversation") + "\n",
+        )
+        .expect("failed to write resumed session's transcript");
+
+        let transcript_path = Arc::new(Mutex::new(Some(first_path.clone())));
+        let watcher = TranscriptWatcher::start(Arc::clone(&transcript_path));
+
+        let lines = wait_until_last_line_is(&watcher, "from the fresh session");
+        assert_eq!(lines, vec!["from the fresh session".to_string()]);
+
+        // The user ran `/resume` in the floating terminal and picked the
+        // other session - Claude Code now reports that file instead.
+        *transcript_path.lock().unwrap() = Some(resumed_path.clone());
+
+        let lines = wait_until_last_line_is(&watcher, "earlier turn from the resumed conversation");
+        assert_eq!(
+            lines,
+            vec!["earlier turn from the resumed conversation".to_string()],
+            "must show only the resumed file's content, not a mix with the old one"
+        );
+
+        // And it keeps following the resumed file as it grows too.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&resumed_path)
+                .expect("failed to open for append");
+            writeln!(file, "{}", assistant_text("new turn after resuming"))
+                .expect("failed to append line");
+        }
+        let lines = wait_until_last_line_is(&watcher, "new turn after resuming");
+        assert_eq!(
+            lines,
+            vec![
+                "earlier turn from the resumed conversation".to_string(),
+                "new turn after resuming".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A context-compaction rewrite (or similar) can replace the transcript
     /// file at the same path with an unrelated new one (a different inode).
     /// Without detecting that, the watcher's already-open handle would just
     /// look permanently quiet, since nothing writes to the old inode anymore.
     #[test]
     fn recovers_after_the_transcript_file_is_replaced_with_a_new_inode() {
-        let projects_root = std::env::temp_dir().join(format!(
-            "cctiles-transcript-replace-test-{}",
-            std::process::id()
-        ));
-        let cwd = "/fake/replaced/project";
-        let project_dir = projects_root.join(sanitize_cwd(cwd));
-
-        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
-
-        std::thread::sleep(Duration::from_millis(100));
-        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
-        let jsonl_path = project_dir.join("session-abc.jsonl");
+        let dir = scratch_dir("replace");
+        let jsonl_path = dir.join("session-abc.jsonl");
         std::fs::write(&jsonl_path, assistant_text("before replace") + "\n")
             .expect("failed to write initial line");
 
+        let transcript_path = Arc::new(Mutex::new(Some(jsonl_path.clone())));
+        let watcher = TranscriptWatcher::start(Arc::clone(&transcript_path));
         let lines = wait_until_last_line_is(&watcher, "before replace");
         assert_eq!(lines.last(), Some(&"before replace".to_string()));
 
@@ -368,7 +413,7 @@ mod tests {
         let lines = wait_until_last_line_is(&watcher, "after replace");
         assert_eq!(lines.last(), Some(&"after replace".to_string()));
 
-        let _ = std::fs::remove_dir_all(&projects_root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An in-place truncate (same inode, shorter content) is a distinct
@@ -377,24 +422,16 @@ mod tests {
     /// anymore - so this needs its own coverage.
     #[test]
     fn recovers_after_the_transcript_file_is_truncated_in_place() {
-        let projects_root = std::env::temp_dir().join(format!(
-            "cctiles-transcript-truncate-test-{}",
-            std::process::id()
-        ));
-        let cwd = "/fake/truncated/project";
-        let project_dir = projects_root.join(sanitize_cwd(cwd));
-
-        let watcher = TranscriptWatcher::start_in(projects_root.clone(), cwd);
-
-        std::thread::sleep(Duration::from_millis(100));
-        std::fs::create_dir_all(&project_dir).expect("failed to create fake project dir");
-        let jsonl_path = project_dir.join("session-abc.jsonl");
+        let dir = scratch_dir("truncate");
+        let jsonl_path = dir.join("session-abc.jsonl");
         std::fs::write(
             &jsonl_path,
             assistant_text("a fairly long message before truncation") + "\n",
         )
         .expect("failed to write initial line");
 
+        let transcript_path = Arc::new(Mutex::new(Some(jsonl_path.clone())));
+        let watcher = TranscriptWatcher::start(Arc::clone(&transcript_path));
         let lines = wait_until_last_line_is(&watcher, "a fairly long message before truncation");
         assert_eq!(
             lines.last(),
@@ -414,6 +451,6 @@ mod tests {
         let lines = wait_until_last_line_is(&watcher, "after truncate");
         assert_eq!(lines.last(), Some(&"after truncate".to_string()));
 
-        let _ = std::fs::remove_dir_all(&projects_root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

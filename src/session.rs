@@ -74,9 +74,15 @@ impl Session {
             }
         });
 
-        let transcript = TranscriptWatcher::start(dir);
+        let (transcript_path, hook_status) = match hooks {
+            Some(hooks) => {
+                let registration = hooks.register(dir);
+                (registration.transcript_path, Some(registration.status))
+            }
+            None => (Arc::new(Mutex::new(None)), None),
+        };
+        let transcript = TranscriptWatcher::start(transcript_path);
         let git_status = GitStatusWatcher::start(dir);
-        let hook_status = hooks.map(|hooks| hooks.register(dir));
 
         Ok(Session {
             child: Mutex::new(child),
