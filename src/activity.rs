@@ -83,16 +83,6 @@ impl ActivityState {
             },
         }
     }
-
-    /// True when the session's most recent tool call is an interactive
-    /// question (`AskUserQuestion`) still waiting on its result - i.e. the
-    /// session is blocked waiting for the user to answer, distinct from
-    /// waiting on a tool-permission prompt (#19).
-    pub fn is_waiting_for_answer(&self) -> bool {
-        self.pending
-            .last()
-            .is_some_and(|(_, tool_use)| tool_use.name == "AskUserQuestion")
-    }
 }
 
 fn describe_tool_use(name: &str, input: &Value) -> String {
@@ -139,12 +129,6 @@ mod tests {
         let mut state = ActivityState::default();
         state.update(lines);
         state.summary()
-    }
-
-    fn is_waiting_for_answer(lines: &[String]) -> bool {
-        let mut state = ActivityState::default();
-        state.update(lines);
-        state.is_waiting_for_answer()
     }
 
     fn assistant_tool_use(id: &str, name: &str, input: Value) -> String {
@@ -237,44 +221,6 @@ mod tests {
             assistant_tool_use("toolu_1", "Bash", serde_json::json!({"command": "ls"})),
         ];
         assert_eq!(summarize(&lines), "Running: ls");
-    }
-
-    #[test]
-    fn pending_ask_user_question_is_waiting_for_answer() {
-        let lines = vec![assistant_tool_use(
-            "toolu_1",
-            "AskUserQuestion",
-            serde_json::json!({"questions": []}),
-        )];
-        assert!(is_waiting_for_answer(&lines));
-    }
-
-    #[test]
-    fn resolved_ask_user_question_is_not_waiting() {
-        let lines = vec![
-            assistant_tool_use(
-                "toolu_1",
-                "AskUserQuestion",
-                serde_json::json!({"questions": []}),
-            ),
-            user_tool_result("toolu_1"),
-        ];
-        assert!(!is_waiting_for_answer(&lines));
-    }
-
-    #[test]
-    fn pending_non_question_tool_is_not_waiting_for_answer() {
-        let lines = vec![assistant_tool_use(
-            "toolu_1",
-            "Bash",
-            serde_json::json!({"command": "cargo test"}),
-        )];
-        assert!(!is_waiting_for_answer(&lines));
-    }
-
-    #[test]
-    fn no_entries_is_not_waiting_for_answer() {
-        assert!(!is_waiting_for_answer(&[]));
     }
 
     #[test]

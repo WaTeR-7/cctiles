@@ -1,16 +1,19 @@
 mod activity;
 mod config;
+mod hooks;
 mod session;
 mod transcript;
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use clap::Parser;
 use config::Config;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use hooks::HookServer;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position};
@@ -81,16 +84,18 @@ enum TileSession {
 }
 
 impl TileSession {
-    fn spawn(dir: &str) -> Self {
-        match Session::spawn(dir) {
+    fn spawn(dir: &str, hooks: &HookServer) -> Self {
+        match Session::spawn(dir, hooks) {
             Ok(session) => TileSession::Running(session),
             Err(err) => TileSession::Failed(err.to_string()),
         }
     }
 }
 
-fn spawn_sessions(dirs: &[String]) -> Vec<TileSession> {
-    dirs.iter().map(|dir| TileSession::spawn(dir)).collect()
+fn spawn_sessions(dirs: &[String], hooks: &HookServer) -> Vec<TileSession> {
+    dirs.iter()
+        .map(|dir| TileSession::spawn(dir, hooks))
+        .collect()
 }
 
 /// Kills every session concurrently instead of one at a time, since each
@@ -127,10 +132,12 @@ fn main() -> io::Result<()> {
         io::Error::other("could not determine a config file location for this platform")
     })?;
 
+    let hooks = Arc::new(HookServer::start().map_err(io::Error::other)?);
+
     let initial_state = if !cli.setup
         && let Some(config) = config::load(&config_path)
     {
-        let sessions = spawn_sessions(&config.tile_dirs);
+        let sessions = spawn_sessions(&config.tile_dirs, &hooks);
         AppState::Grid {
             config,
             sessions,
@@ -148,12 +155,17 @@ fn main() -> io::Result<()> {
     };
 
     let terminal = ratatui::init();
-    let result = run(terminal, config_path, initial_state);
+    let result = run(terminal, config_path, initial_state, hooks);
     ratatui::restore();
     result
 }
 
-fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState) -> io::Result<()> {
+fn run(
+    mut terminal: DefaultTerminal,
+    config_path: PathBuf,
+    mut state: AppState,
+    hooks: Arc<HookServer>,
+) -> io::Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, &state))?;
 
@@ -227,7 +239,7 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                         tile_dirs: dirs.clone(),
                     };
                     let _ = config::save(&config_path, &config);
-                    let sessions = spawn_sessions(&config.tile_dirs);
+                    let sessions = spawn_sessions(&config.tile_dirs, &hooks);
                     state = AppState::Grid {
                         config,
                         sessions,
@@ -295,7 +307,7 @@ fn run(mut terminal: DefaultTerminal, config_path: PathBuf, mut state: AppState)
                                     pending_kills.push(kill_in_background(old));
                                 }
                                 if let Some(dir) = config.tile_dirs.get(index) {
-                                    *slot = TileSession::spawn(dir);
+                                    *slot = TileSession::spawn(dir, &hooks);
                                 }
                             }
                         }
@@ -446,7 +458,7 @@ fn draw_grid(
                 .get(dir_index)
                 .map(String::as_str)
                 .unwrap_or("");
-            let (summary, status_color) = match sessions.get(dir_index) {
+            let (summary, indicator_color) = match sessions.get(dir_index) {
                 Some(TileSession::Running(session)) => {
                     let status = session.status();
                     let summary = if status == SessionStatus::Crashed {
@@ -455,28 +467,35 @@ fn draw_grid(
                         session.activity_summary()
                     };
                     let color = match status {
-                        SessionStatus::Crashed => Some(Color::Magenta),
+                        SessionStatus::Crashed => Color::Red,
                         SessionStatus::WaitingForAnswer | SessionStatus::WaitingForPermission => {
-                            Some(Color::Red)
+                            Color::Yellow
                         }
-                        SessionStatus::Normal => None,
+                        SessionStatus::BackgroundTaskRunning => Color::Cyan,
+                        SessionStatus::Working => Color::Green,
+                        SessionStatus::Idle => Color::White,
                     };
-                    (summary, color)
+                    (summary, Some(color))
                 }
                 Some(TileSession::Failed(err)) => {
-                    (format!("Failed to start: {err}"), Some(Color::Magenta))
+                    (format!("Failed to start: {err}"), Some(Color::Red))
                 }
                 Some(TileSession::Empty) => ("[no session]".to_string(), None),
                 None => (String::new(), None),
             };
-            let border_color = status_color.or(if (row_index, col_index) == focused {
-                Some(Color::Yellow)
-            } else {
-                None
-            });
-            let mut block = Block::bordered().title(format!(" {dir} "));
-            if let Some(color) = border_color {
-                block = block.border_style(Style::default().fg(color));
+            // The border is reserved for focus alone (a status color there
+            // would fight with it, since a tile can be both focused and,
+            // say, waiting for permission at once - see #57). Session state
+            // instead shows as a colored indicator dot in the title.
+            let mut title_spans = vec![Span::raw(" ")];
+            if let Some(color) = indicator_color {
+                title_spans.push(Span::styled("●", Style::default().fg(color)));
+                title_spans.push(Span::raw(" "));
+            }
+            title_spans.push(Span::raw(format!("{dir} ")));
+            let mut block = Block::bordered().title(Line::from(title_spans));
+            if (row_index, col_index) == focused {
+                block = block.border_style(Style::default().fg(Color::Yellow));
             }
             let inner_area = block.inner(*tile_area);
             frame.render_widget(block, *tile_area);

@@ -42,13 +42,6 @@ impl TranscriptWatcher {
             .map(|state| state.summary())
             .unwrap_or_else(|_| "Idle".to_string())
     }
-
-    pub fn is_waiting_for_answer(&self) -> bool {
-        self.activity
-            .lock()
-            .map(|state| state.is_waiting_for_answer())
-            .unwrap_or(false)
-    }
 }
 
 fn claude_projects_dir() -> PathBuf {
