@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::git_info::GitStatusWatcher;
 use crate::hooks::HookServer;
 use crate::transcript::TranscriptWatcher;
 
@@ -15,6 +16,7 @@ pub struct Session {
     writer: Mutex<Box<dyn Write + Send>>,
     screen: Arc<Mutex<vt100::Parser>>,
     transcript: TranscriptWatcher,
+    git_status: GitStatusWatcher,
     /// Live status fed by Claude Code's own hooks (see `hooks.rs`), or
     /// `None` for sessions spawned without a `HookServer` (only test
     /// sessions that don't run the real `claude` binary and so never fire
@@ -73,6 +75,7 @@ impl Session {
         });
 
         let transcript = TranscriptWatcher::start(dir);
+        let git_status = GitStatusWatcher::start(dir);
         let hook_status = hooks.map(|hooks| hooks.register(dir));
 
         Ok(Session {
@@ -81,6 +84,7 @@ impl Session {
             writer: Mutex::new(writer),
             screen,
             transcript,
+            git_status,
             hook_status,
         })
     }
@@ -122,6 +126,12 @@ impl Session {
 
     pub fn activity_summary(&self) -> String {
         self.transcript.activity_summary()
+    }
+
+    /// The current branch and working-tree diffstat (e.g. `"main  +3/-1"`),
+    /// or `None` when `dir` isn't a git repository.
+    pub fn git_status_summary(&self) -> Option<String> {
+        self.git_status.summary()
     }
 
     /// Whether the child process is still running. Checked with a
