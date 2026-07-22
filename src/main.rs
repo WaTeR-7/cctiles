@@ -64,9 +64,9 @@ enum AppState {
         /// exiting before an in-flight kill has actually run.
         pending_kills: Vec<JoinHandle<()>>,
         focused: (usize, usize),
-        /// True while the focused tile's session is shown full-screen (#22),
-        /// in which case key input is forwarded to it instead of driving
-        /// grid navigation.
+        /// True while the focused tile's session is shown as a floating
+        /// overlay (#22, #66), in which case key input is forwarded to it
+        /// instead of driving grid navigation.
         floating: bool,
         /// True while the keybinding help overlay (#25) is shown on top of
         /// the grid.
@@ -380,17 +380,15 @@ fn draw(frame: &mut Frame, state: &AppState) {
             help_visible,
             ..
         } => {
+            draw_grid(frame, config, sessions, *focused);
             let index = config.tile_index(focused.0, focused.1);
-            match (floating, sessions.get(index)) {
-                (true, Some(TileSession::Running(session))) => {
-                    let dir = config
-                        .tile_dirs
-                        .get(index)
-                        .map(String::as_str)
-                        .unwrap_or("");
-                    draw_floating(frame, dir, session);
-                }
-                _ => draw_grid(frame, config, sessions, *focused),
+            if *floating && let Some(TileSession::Running(session)) = sessions.get(index) {
+                let dir = config
+                    .tile_dirs
+                    .get(index)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                draw_floating(frame, dir, session);
             }
             if *help_visible {
                 draw_help(frame);
@@ -548,7 +546,8 @@ fn draw_grid(
 }
 
 /// Centers a `width`x`height` rect within `area`, clamped so it never
-/// exceeds it. Used to place the keybinding help overlay (#25).
+/// exceeds it. Used to place the keybinding help overlay (#25) and the
+/// floating terminal (#66).
 fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -567,7 +566,7 @@ fn draw_help(frame: &mut Frame) {
     let lines = vec![
         Line::from("Grid"),
         Line::from("  hjkl / arrow keys   move focus"),
-        Line::from("  enter               open the focused session full-screen"),
+        Line::from("  enter               open the focused session as a floating terminal"),
         Line::from("  r                   restart the focused tile's session"),
         Line::from("  x                   kill the focused tile's session"),
         Line::from("  ?                   toggle this help"),
@@ -594,12 +593,24 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
     }
 }
 
-/// Renders a session's live screen full-screen, matching the underlying
-/// PTY's size to the rendered area every frame (#22/#24) so it always
-/// reflects the real terminal window rather than the hardcoded spawn-time
-/// default.
+/// Caps the floating terminal's width so its lines stay readable on a wide
+/// terminal, and insets it from the edges so the grid remains visible
+/// around it (see #66) - a fixed margin rather than a fixed size, since
+/// unlike the help overlay this should still make use of extra space on a
+/// modestly-sized terminal.
+fn floating_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let width = area.width.saturating_sub(4).min(100);
+    let height = area.height.saturating_sub(4);
+    centered_rect(width, height, area)
+}
+
+/// Renders a session's live screen as a floating overlay on top of the grid
+/// (#66) rather than full-screen, matching the underlying PTY's size to the
+/// rendered area every frame (#22/#24) so it always reflects the actual
+/// rendered size rather than the hardcoded spawn-time default.
 fn draw_floating(frame: &mut Frame, dir: &str, session: &Session) {
-    let area = frame.area();
+    let area = floating_rect(frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
     let title = if session.status() == SessionStatus::Crashed {
         format!(" {dir} — session ended — Ctrl+G: back to grid ")
     } else {
